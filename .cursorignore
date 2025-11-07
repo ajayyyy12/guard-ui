@@ -1,0 +1,7 @@
+# Cursor ignore file
+# This file helps Cursor ignore certain warnings
+
+# Ignore import warnings for packages that are correctly installed
+firebase_admin
+win32api
+serial

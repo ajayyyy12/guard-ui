@@ -1,0 +1,11 @@
+# Required packages for Final guard_ui_2.py
+firebase-admin>=6.0.0
+pywin32>=306
+pyserial>=3.5
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+Pillow>=9.0.0
+numpy>=1.21.0
+tkinter
+
+

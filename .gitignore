@@ -1,0 +1,41 @@
+# Sensitive files
+serviceAccountKey.json
+*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Model files
+*.pt
+*.pth
+*.onnx
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug outputs
+debug_outputs/
+comparison_outputs/
+
+# Images (if you don't want to commit them)
+# student_images/
+# teacher_images/
+
