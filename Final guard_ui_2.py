@@ -953,6 +953,13 @@ class GuardMainControl:
         self.requirements_hide_scheduled = False  # Flag to track if hide is already scheduled
         self.incomplete_student_info_for_retry = None  # Store student info when incomplete uniform timeout occurs
         
+        # State tracking for DENIED button toggle functionality
+        self.denied_button_clicked = False  # Flag to track if DENIED button was clicked
+        self.original_detection_state = None  # Store original uniform detection state (complete/incomplete)
+        self.original_uniform_status = None  # Store if student was originally complete or incomplete
+        self.complete_uniform_auto_entry_timer = None  # Timer for auto-entry after complete uniform (8 seconds)
+        self.complete_uniform_student_info = None  # Store student info for complete uniform auto-entry
+        
         # Initialize Arduino connection after UI is ready
         self.root.after(300, self.init_arduino_connection)
         
@@ -2104,7 +2111,24 @@ class GuardMainControl:
                             course = student_info.get('course', '')
                             gender = student_info.get('gender', '')
                             self.set_uniform_requirements_by_course(course, gender)
-                            self.show_requirements_section()
+                            self.show_requirements_section(student_info)
+                            
+                            # Reset denied button state flags when new student ID is tapped (but keep button enabled)
+                            # Only reset flags, don't disable button - it will be enabled when detection starts
+                            self.denied_button_clicked = False
+                            self.original_detection_state = None
+                            self.original_uniform_status = None
+                            
+                            # Reset DENIED button text and command to original (but keep it enabled)
+                            if hasattr(self, 'deny_button') and self.deny_button:
+                                self.deny_button.config(
+                                    text="DENIED\n(Keep Locked)",
+                                    command=self.handle_interface_deny
+                                )
+                            
+                            # Make checkboxes read-only initially
+                            self._make_requirement_checkboxes_editable(False)
+                            
                             print(f"✅ Requirements section shown for: {course} ({gender})")
                     except Exception as e:
                         print(f"⚠️ Error setting requirements: {e}")
@@ -2464,11 +2488,10 @@ class GuardMainControl:
             except Exception:
                 pass
 
-            # Hide requirements section when no student is active
-            # BUT: Only hide immediately if not already scheduled for delayed hiding
-            # (This allows requirements section to stay visible for 5 seconds after detection stops)
-            if not self.requirements_hide_scheduled:
-                self.hide_requirements_section()
+            # Keep requirements section visible - only hide when gate control button is clicked
+            # Don't hide when detection stops - requirements stay visible until guard clicks a button
+            # if not self.requirements_hide_scheduled:
+            #     self.hide_requirements_section()
 
             # Update the UI label to show that preview is disabled (external window is used)
             if hasattr(self, 'camera_label') and self.camera_label:
@@ -3981,15 +4004,16 @@ class GuardMainControl:
         content_frame = tk.Frame(main_container, bg='#ffffff')
         content_frame.pack(fill=tk.BOTH, expand=True, pady=(20, 0))
         
-        # Left column - Person ID Entry (dashboard controls)
-        # Increased width to accommodate 4 buttons in Gate Control section
+        # Left column - Person ID Entry and Requirement Parts
         left_column = tk.Frame(content_frame, bg='#ffffff', width=520)
         left_column.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
         left_column.pack_propagate(False)
 
-        # Put person entry and gate controls on the left (this keeps Return RFID under Log Entry)
-        # Gate control is now integrated into the Person ID Entry section
+        # Put person entry and gate controls on the left
         self.create_person_entry_section(left_column)
+        
+        # Requirement Parts section - moved from camera feed right panel
+        self.create_requirement_parts_section(left_column)
         
         # Guard on duty display - at the bottom of left column
         guard_duty_frame = tk.Frame(left_column, bg='#ffffff')
@@ -4023,22 +4047,24 @@ class GuardMainControl:
         if hasattr(self, 'current_guard_id') and self.current_guard_id:
             self.update_guard_name_display(self.current_guard_id)
 
-        # Right column - Camera Feed (top) and Activity Logs (bottom)
+        # Right column - Camera Feed only
         right_column = tk.Frame(content_frame, bg='#ffffff')
         right_column.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(12, 0))
 
-        # Camera feed container - at top, fills most of the space
+        # Camera feed container - fills the right column
         camera_container = tk.Frame(right_column, bg='#ffffff')
-        camera_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=(0, 0), pady=(0, 8))
+        camera_container.pack(fill=tk.BOTH, expand=True, padx=(0, 0), pady=(0, 0))
         camera_container.pack_propagate(False)
 
-        # Logs container - positioned at bottom with good height for visibility
-        logs_container = tk.Frame(right_column, bg='#ffffff', height=250)
-        logs_container.pack(side=tk.BOTTOM, fill=tk.X, expand=False, padx=(0, 0), pady=(8, 0))
-        logs_container.pack_propagate(False)
-
-        # Create sections - camera first, then logs at bottom
+        # Create camera feed section
         self.create_camera_feed_section(camera_container)
+        
+        # Activity Log - full width at bottom, below both columns
+        logs_container = tk.Frame(content_frame, bg='#ffffff', height=250)
+        logs_container.pack(side=tk.BOTTOM, fill=tk.X, expand=False, padx=(0, 0), pady=(12, 0))
+        logs_container.pack_propagate(False)
+        
+        # Create activity logs section
         self.create_activity_logs_section(logs_container)
     
     def create_person_entry_section(self, parent):
@@ -4062,25 +4088,7 @@ class GuardMainControl:
         special_buttons_frame = tk.Frame(type_frame, bg='#ffffff')
         special_buttons_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # Student who forgot ID button - much larger
-        self.forgot_id_btn = tk.Button(
-            special_buttons_frame,
-            text="🔑 Temporary Student ID",
-            command=self.handle_forgot_id,
-            font=('Arial', 12, 'bold'),
-            bg='#f59e0b',
-            fg='white',
-            relief='raised',
-            bd=3,
-            padx=20,
-            pady=12,
-            cursor='hand2',
-            activebackground='#d97706',
-            activeforeground='white'
-        )
-        self.forgot_id_btn.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
-        
-        # Manual visitor entry button - much larger
+        # Manual visitor entry button
         self.manual_visitor_btn = tk.Button(
             special_buttons_frame,
             text="📝 Visitor",
@@ -4096,7 +4104,25 @@ class GuardMainControl:
             activebackground='#059669',
             activeforeground='white'
         )
-        self.manual_visitor_btn.pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
+        self.manual_visitor_btn.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
+        
+        # Event Mode toggle button - moved from gate control section
+        self.event_mode_btn = tk.Button(
+            special_buttons_frame,
+            text="Event Mode:\nOFF",
+            font=('Arial', 12, 'bold'),
+            bg='#9ca3af',  # Gray when OFF
+            fg='white',
+            relief='raised',
+            bd=3,
+            padx=20,
+            pady=12,
+            cursor='hand2',
+            activebackground='#6b7280',
+            activeforeground='white',
+            command=self.toggle_event_mode
+        )
+        self.event_mode_btn.pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
         
         # Return RFID button
         return_rfid_frame = tk.Frame(entry_frame, bg='#ffffff')
@@ -4161,7 +4187,7 @@ class GuardMainControl:
         if hasattr(self, 'arduino_connected') and self.arduino_connected:
             self.update_arduino_connection_status(True)
         
-        # Control buttons frame - all 4 buttons in one row
+        # Control buttons frame - 3 buttons in one row
         buttons_frame = tk.Frame(gate_control_frame, bg='#ffffff')
         buttons_frame.pack(fill=tk.X, pady=(0, 5))
         
@@ -4187,10 +4213,30 @@ class GuardMainControl:
         # Store incomplete student info for APPROVE button (similar to approve_complete_uniform)
         self.incomplete_student_info_for_approve = None
         
+        # Cancel button - DISABLED by default, only enabled after incomplete uniform or DENIED clicked
+        self.cancel_button = tk.Button(
+            buttons_frame,
+            text="CANCEL",
+            font=('Arial', 9, 'bold'),
+            bg='#6b7280',
+            fg='white',
+            disabledforeground='#d1d5db',  # Light gray text when disabled - ensures text is visible
+            relief='raised',
+            bd=2,
+            padx=5,
+            pady=6,
+            cursor='hand2',
+            activebackground='#4b5563',
+            activeforeground='white',
+            command=self.handle_interface_cancel,
+            state=tk.DISABLED  # Disabled by default - only enabled after incomplete uniform or DENIED clicked
+        )
+        self.cancel_button.pack(side=tk.LEFT, padx=(2, 2), fill=tk.X, expand=True)
+        
         # Deny button
         self.deny_button = tk.Button(
             buttons_frame,
-            text="ACCESS DENIED\n(Keep Locked)",
+            text="DENIED\n(Keep Locked)",
             font=('Arial', 9, 'bold'),
             bg='#dc2626',
             fg='white',
@@ -4203,44 +4249,7 @@ class GuardMainControl:
             activeforeground='white',
             command=self.handle_interface_deny
         )
-        self.deny_button.pack(side=tk.LEFT, padx=(2, 2), fill=tk.X, expand=True)
-        
-        # Approve Complete Uniform button
-        self.approve_complete_uniform_btn = tk.Button(
-            buttons_frame,
-            text="ACCESS GRANTED\nCOMPLETE UNIFORM",
-            font=('Arial', 9, 'bold'),
-            bg='#10b981',  # Green color for approval
-            fg='white',
-            relief='raised',
-            bd=2,
-            padx=5,
-            pady=6,
-            cursor='hand2',
-            activebackground='#059669',
-            activeforeground='white',
-            command=self.approve_complete_uniform,
-            state=tk.DISABLED  # Initially disabled
-        )
-        self.approve_complete_uniform_btn.pack(side=tk.LEFT, padx=(2, 2), fill=tk.X, expand=True)
-        
-        # Event Mode toggle button - make sure it's visible
-        self.event_mode_btn = tk.Button(
-            buttons_frame,
-            text="Event Mode:\nOFF",
-            font=('Arial', 9, 'bold'),
-            bg='#9ca3af',  # Gray when OFF
-            fg='white',
-            relief='raised',
-            bd=2,
-            padx=5,
-            pady=6,
-            cursor='hand2',
-            activebackground='#6b7280',
-            activeforeground='white',
-            command=self.toggle_event_mode
-        )
-        self.event_mode_btn.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+        self.deny_button.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
         
         # Instructions
         instructions_label = tk.Label(
@@ -4268,10 +4277,64 @@ class GuardMainControl:
         )
         # Position it off-screen but keep it in the widget tree
         self.hidden_rfid_entry.place(x=-100, y=-100)
+        
         # Bind Return key to auto-process RFID input
         self.hidden_rfid_entry.bind('<Return>', lambda e: self.process_rfid_input())
         # Keep it always ready for RFID input
         self.hidden_rfid_entry.config(takefocus=True)
+    
+    def create_requirement_parts_section(self, parent):
+        """Create Requirement Parts section in left column"""
+        # Requirement Parts frame
+        self.requirements_frame = tk.LabelFrame(
+            parent,
+            text="Requirement Parts",
+            font=('Arial', 12, 'bold'),
+            fg='#1f2937',
+            bg='#ffffff',
+            relief='groove',
+            bd=2
+        )
+        self.requirements_frame.pack(fill=tk.X, padx=15, pady=(10, 15))
+        
+        # Student info label - Name and Course/Senior High School
+        self.requirements_student_info_label = tk.Label(
+            self.requirements_frame,
+            text="",
+            font=('Arial', 10, 'bold'),
+            fg='#1f2937',
+            bg='#ffffff',
+            justify=tk.LEFT
+        )
+        self.requirements_student_info_label.pack(anchor='w', padx=15, pady=(10, 5))
+        
+        # Status label - IN/COMPLETE UNIFORM
+        self.requirements_status_label = tk.Label(
+            self.requirements_frame,
+            text="IN/COMPLETE UNIFORM",
+            font=('Arial', 11, 'bold'),
+            fg='#dc2626',
+            bg='#ffffff',
+            justify=tk.LEFT
+        )
+        self.requirements_status_label.pack(anchor='w', padx=15, pady=(0, 5))
+        
+        # Requirements container frame for checkboxes
+        self.requirements_container = tk.Frame(self.requirements_frame, bg='#ffffff')
+        self.requirements_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
+        
+        # Dictionary to store checkbox variables and widgets
+        self.requirement_checkboxes = {}  # key: requirement_name (lowercase) -> {'var': tk.BooleanVar, 'widget': Checkbutton}
+        self.requirement_checkbox_widgets = {}  # key: requirement_name (lowercase) -> Checkbutton widget
+        
+        # Hide requirements section by default - only show when student ID is tapped
+        self.requirements_frame.pack_forget()
+        
+        # Populate initial requirements list (will be shown when student ID is tapped)
+        try:
+            self._render_uniform_requirements()
+        except Exception:
+            pass
     
     def setup_rfid_focus_management(self):
         """Set up periodic focus management for hidden RFID Entry field"""
@@ -10341,7 +10404,7 @@ class GuardMainControl:
                         self.detection_system.stop_detection()
                         time.sleep(0.1)
             
-            # CRITICAL: Disable APPROVE button when detection starts
+            # CRITICAL: Disable APPROVE and CANCEL buttons when detection starts
             if hasattr(self, 'approve_button'):
                 try:
                     self.approve_button.config(state=tk.DISABLED)
@@ -10349,6 +10412,30 @@ class GuardMainControl:
                     print(f"✅ APPROVE button disabled - detection starting")
                 except Exception as e:
                     print(f"⚠️ WARNING: Could not disable APPROVE button: {e}")
+            
+            if hasattr(self, 'cancel_button'):
+                try:
+                    self.cancel_button.config(state=tk.DISABLED)
+                    print(f"✅ CANCEL button disabled - detection starting")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not disable CANCEL button: {e}")
+            
+            # Reset denied button state flags (but keep DENIED button enabled - enable it early during detection)
+            # Only reset the flags, don't disable the button yet
+            self.denied_button_clicked = False
+            self.original_detection_state = None
+            self.original_uniform_status = None
+            
+            # Enable DENIED button early during detection (guard can click it anytime during detection)
+            if hasattr(self, 'deny_button'):
+                try:
+                    self.deny_button.config(state=tk.NORMAL)
+                    print(f"✅ DENIED button enabled - detection started, guard can click anytime")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+            
+            # Make checkboxes read-only when detection starts
+            self._make_requirement_checkboxes_editable(False)
             
             # Log activity (detection started, not entry) - ONLY if Event Mode is OFF
             if not getattr(self, 'event_mode_active', False):
@@ -10653,10 +10740,8 @@ class GuardMainControl:
             self._permanently_checked_requirements = set()
             self.requirements_hide_scheduled = False  # Reset flag for new detection
             
-            # Disable retry button when starting new detection
-            if hasattr(self, 'approve_complete_uniform_btn'):
-                self.approve_complete_uniform_btn.config(state=tk.DISABLED)
-                self.incomplete_student_info_for_retry = None
+            # Disable retry button when starting new detection (removed approve_complete_uniform_btn)
+            self.incomplete_student_info_for_retry = None
             
             # Disable ID input field during detection to prevent 2nd person from tapping
             if hasattr(self, 'person_id_entry'):
@@ -10692,7 +10777,23 @@ class GuardMainControl:
             self.set_uniform_requirements_by_course(course, gender)
             
             # Show uniform requirements section when student ID is tapped
-            self.show_requirements_section()
+            self.show_requirements_section(student_info)
+            
+            # Reset denied button state flags when new student ID is tapped (but keep button enabled)
+            # Only reset flags, don't disable button - it will be enabled when detection starts
+            self.denied_button_clicked = False
+            self.original_detection_state = None
+            self.original_uniform_status = None
+            
+            # Reset DENIED button text and command to original (but keep it enabled)
+            if hasattr(self, 'deny_button') and self.deny_button:
+                self.deny_button.config(
+                    text="DENIED\n(Keep Locked)",
+                    command=self.handle_interface_deny
+                )
+            
+            # Make checkboxes read-only initially
+            self._make_requirement_checkboxes_editable(False)
 
             def _run_stream():
                 try:
@@ -10851,13 +10952,13 @@ class GuardMainControl:
                     # After it exits, keep UI in standby view
                     try:
                         self.initialize_guard_camera_feed()
-                        # Only hide requirements section immediately if not already scheduled for delayed hiding
-                        # (This allows 5-second visibility for guard to see complete/incomplete status)
-                        if not self.requirements_hide_scheduled:
-                            self.hide_requirements_section()
-                        else:
-                            # Reset flag after scheduled hide completes
-                            self.root.after(5100, lambda: setattr(self, 'requirements_hide_scheduled', False))
+                        # Keep requirements section visible - only hide when gate control button is clicked
+                        # Don't hide when detection stops - requirements stay visible until guard clicks a button
+                        # if not self.requirements_hide_scheduled:
+                        #     self.hide_requirements_section()
+                        # else:
+                        #     # Reset flag after scheduled hide completes
+                        #     self.root.after(5100, lambda: setattr(self, 'requirements_hide_scheduled', False))
                     except Exception:
                         pass
 
@@ -11434,14 +11535,16 @@ class GuardMainControl:
                             except Exception as e:
                                 print(f"⚠️ WARNING: Could not clear detection session: {e}")
                             
-                            # CRITICAL: Disable BOTH buttons after processing
+                            # CRITICAL: Disable buttons after processing
                             if hasattr(self, 'approve_button'):
                                 self.approve_button.config(state=tk.DISABLED)
                                 print(f"✅ APPROVE button disabled after processing")
                             
-                            if hasattr(self, 'approve_complete_uniform_btn'):
-                                self.approve_complete_uniform_btn.config(state=tk.DISABLED)
-                                print(f"✅ APPROVE COMPLETE UNIFORM button disabled after processing")
+                            if hasattr(self, 'cancel_button'):
+                                self.cancel_button.config(state=tk.DISABLED)
+                                print(f"✅ CANCEL button disabled after processing")
+                            
+                            # Removed approve_complete_uniform_btn - no longer needed
                             
                             # Clear stored incomplete student info
                             self.incomplete_student_info_for_approve = None
@@ -12590,7 +12693,7 @@ class GuardMainControl:
         pass
     
     def create_camera_feed_section(self, parent):
-        """Create camera feed section in box/portrait orientation"""
+        """Create camera feed section - simplified, no right panel"""
         camera_frame = tk.LabelFrame(
             parent,
             text="LIVE CAMERA FEED",
@@ -12602,69 +12705,9 @@ class GuardMainControl:
         )
         camera_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
         
-        # Two-column layout: camera on left, detected classes list on right
-        container = tk.Frame(camera_frame, bg='#ffffff')
-        container.pack(fill=tk.BOTH, expand=True)
-        
-        left_panel = tk.Frame(container, bg='#ffffff')
-        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 10), pady=10)
-        
-        right_panel = tk.LabelFrame(
-            container,
-            text="LIST OF DETECTED CLASS",
-            font=('Arial', 12, 'bold'),
-            fg='#374151',
-            bg='#ffffff',
-            relief='groove',
-            bd=2
-        )
-        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(0, 10), pady=10)
-        right_panel.pack_propagate(False)
-        try:
-            right_panel.configure(width=280)
-        except Exception:
-            pass
-        
-        # Top section: Requirements (hidden by default, shown when student ID is tapped)
-        top_section = tk.Frame(right_panel, bg='#ffffff')
-        top_section.pack(side=tk.TOP, fill=tk.X, padx=0, pady=(0, 5))
-        
-        # Requirements frame - inside top section
-        self.requirements_frame = tk.LabelFrame(
-            top_section,
-            text="UNIFORM REQUIREMENTS",
-            font=('Arial', 11, 'bold'),
-            fg='#1f2937',
-            bg='#ffffff',
-            relief='groove',
-            bd=1
-        )
-        # Hide requirements frame initially - only show when student ID is tapped
-        self.requirements_frame.pack_forget()
-
-        self.requirements_status_label = tk.Label(
-            self.requirements_frame,
-            text="Incomplete",
-            font=('Arial', 11, 'bold'),
-            fg='#dc2626',
-            bg='#ffffff',
-            justify=tk.LEFT
-        )
-        self.requirements_status_label.pack(anchor='w', padx=6, pady=(6, 2))
-
-        self.requirements_listbox = tk.Listbox(
-            self.requirements_frame,
-            font=('Arial', 10),
-            bg='#ffffff',
-            fg='#111827',
-            height=8,
-            activestyle='none'
-        )
-        self.requirements_listbox.pack(fill=tk.X, padx=6, pady=(0, 6))
-        
         # Camera feed label with box/portrait orientation - STANDBY MODE
         self.camera_label = tk.Label(
-            left_panel,
+            camera_frame,
             text="📷 CAMERA FEED (STANDBY MODE)\n\n🔒 Camera is CLOSED\n\nCamera will ONLY open when:\n• Student taps their ID\n• Detection process starts\n\nNo camera access during guard login\n\n💡 Camera preview will show here\nwhen detection is active",
             font=('Arial', 12),
             fg='#374151',
@@ -12675,53 +12718,15 @@ class GuardMainControl:
         )
         self.camera_label.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
         
-        # Bottom section: Detected classes list + scrollbar (below requirements)
-        bottom_section = tk.Frame(right_panel, bg='#ffffff')
-        bottom_section.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
-        
-        detected_label = tk.Label(
-            bottom_section,
-            text="Detected Classes:",
-            font=('Arial', 10, 'bold'),
-            bg='#ffffff',
-            fg='#374151'
-        )
-        detected_label.pack(anchor='w', pady=(0, 5))
-        
-        list_container = tk.Frame(bottom_section, bg='#ffffff')
-        list_container.pack(fill=tk.BOTH, expand=True)
-        
-        self.detected_classes_listbox = tk.Listbox(
-            list_container,
-            font=('Arial', 11),
-            bg='#ffffff',
-            fg='#1e3a8a',
-            selectbackground='#3b82f6',
-            height=15
-        )
-        self.detected_classes_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        detected_scrollbar = tk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.detected_classes_listbox.yview)
-        self.detected_classes_listbox.config(yscrollcommand=detected_scrollbar.set)
-        detected_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
         # Set minimum height for portrait orientation
         camera_frame.configure(height=520)
 
-        # Populate initial requirements list
-        try:
-            self._render_uniform_requirements()
-        except Exception:
-            pass
-
     def update_detected_classes_list(self, detected_classes):
-        """Update the UI list with currently detected classes.
+        """Update detected classes - now adds to activity log instead of separate listbox.
         Accepts either a list of dicts with keys 'class_name' and 'confidence',
         or a list of strings.
         """
         try:
-            if not hasattr(self, 'detected_classes_listbox') or not self.detected_classes_listbox:
-                return
             # Normalize names in the worker thread first
             names = []
             for item in (detected_classes or []):
@@ -12747,17 +12752,14 @@ class GuardMainControl:
             # Marshal UI update to main thread
             def _apply(names_list):
                 try:
-                    # If empty, show last known detections (do not clear immediately)
+                    # If empty, use last known detections (do not clear immediately)
                     effective = names_list if names_list else getattr(self, '_last_detected_classes', [])
-                    self.detected_classes_listbox.delete(0, tk.END)
-                    if not effective:
-                        self.detected_classes_listbox.insert(tk.END, "No detection")
-                        return
-                    seen = set()
-                    for n in effective:
-                        if n not in seen:
-                            self.detected_classes_listbox.insert(tk.END, n)
-                            seen.add(n)
+                    
+                    # Add detected classes to activity log if there are new detections
+                    if effective and effective != getattr(self, '_last_logged_classes', []):
+                        detected_str = ", ".join(effective)
+                        self.add_activity_log(f"Detected: {detected_str}")
+                        self._last_logged_classes = effective.copy()
 
                     # Update requirements panel against current effective detections
                     try:
@@ -12840,11 +12842,36 @@ class GuardMainControl:
         except Exception:
             pass
     
-    def show_requirements_section(self):
+    def update_requirements_student_info(self, student_info=None):
+        """Update student name and course in requirements section"""
+        try:
+            if hasattr(self, 'requirements_student_info_label') and self.requirements_student_info_label:
+                if student_info:
+                    name = student_info.get('name', 'Unknown')
+                    course = student_info.get('course', 'Unknown Course')
+                    # Format: "Name - Course/Senior High School"
+                    self.requirements_student_info_label.config(text=f"{name} - {course}")
+                else:
+                    # Clear if no student info
+                    self.requirements_student_info_label.config(text="")
+        except Exception as e:
+            print(f"⚠️ Error updating requirements student info: {e}")
+    
+    def show_requirements_section(self, student_info=None):
         """Show the uniform requirements section when student ID is tapped."""
         try:
             if hasattr(self, 'requirements_frame') and self.requirements_frame:
-                self.requirements_frame.pack(fill=tk.X, padx=0, pady=0, before=None)
+                # Update student info if provided
+                if student_info:
+                    self.update_requirements_student_info(student_info)
+                
+                # Check if already visible, if not then pack it
+                try:
+                    self.requirements_frame.pack_info()
+                    # Already visible, no need to pack again
+                except tk.TclError:
+                    # Not visible, pack it
+                    self.requirements_frame.pack(fill=tk.X, padx=15, pady=(10, 15), before=None)
         except Exception:
             pass
     
@@ -12856,6 +12883,10 @@ class GuardMainControl:
                 # Reset the scheduled flag when actually hiding
                 self.requirements_hide_scheduled = False
             
+            # Clear student info label when hiding
+            if hasattr(self, 'requirements_student_info_label') and self.requirements_student_info_label:
+                self.requirements_student_info_label.config(text="")
+            
             # Also return main screen to standby when requirements section is hidden
             # (This happens after the 5-second delay for showing status)
             if self.main_screen_window and self.main_screen_window.winfo_exists():
@@ -12865,16 +12896,74 @@ class GuardMainControl:
             pass
 
     def _render_uniform_requirements(self):
-        """Render the static list of required parts for current uniform."""
-        if not hasattr(self, 'requirements_listbox') or not self.requirements_listbox:
+        """Render the static list of required parts for current uniform as checkboxes."""
+        if not hasattr(self, 'requirements_container') or not self.requirements_container:
             return
         try:
-            self.requirements_listbox.delete(0, tk.END)
+            # Clear existing checkboxes
+            for widget in self.requirements_container.winfo_children():
+                widget.destroy()
+            self.requirement_checkboxes = {}
+            self.requirement_checkbox_widgets = {}
+            
+            # Create checkboxes for each requirement
             for part in self.current_uniform_requirements:
-                self.requirements_listbox.insert(tk.END, f"◻ {part}")
-            self.requirements_status_label.config(text="Incomplete uniform", fg='#dc2626')
-        except Exception:
-            pass
+                key = part.lower()
+                
+                # Create BooleanVar for checkbox state (False = unchecked = missing = shows X)
+                var = tk.BooleanVar(value=False)  # Initially unchecked (missing)
+                self.requirement_checkboxes[key] = {'var': var, 'part': part}
+                
+                # Create checkbox with label showing "✗ {part}" when unchecked, "{part}" when checked
+                # Use lambda with default arguments to capture current values
+                def make_update_callback(part_name, var_ref, key_ref):
+                    def update_label():
+                        checkbox_widget = self.requirement_checkbox_widgets.get(key_ref)
+                        if checkbox_widget:
+                            if var_ref.get():
+                                # Checked = detected = no X mark
+                                checkbox_widget.config(text=part_name)
+                            else:
+                                # Unchecked = missing = X mark
+                                checkbox_widget.config(text=f"✗ {part_name}")
+                    return update_label
+                
+                checkbox = tk.Checkbutton(
+                    self.requirements_container,
+                    text=f"✗ {part}",  # Initially unchecked (missing)
+                    variable=var,
+                    font=('Arial', 10),
+                    bg='#ffffff',
+                    fg='#111827',
+                    anchor='w',
+                    command=make_update_callback(part, var, key),
+                    state=tk.DISABLED  # Initially read-only, will be enabled after DENIED is clicked
+                )
+                checkbox.pack(fill=tk.X, pady=2)
+                self.requirement_checkbox_widgets[key] = checkbox
+            
+            self.requirements_status_label.config(text="IN/COMPLETE UNIFORM", fg='#dc2626')
+        except Exception as e:
+            print(f"ERROR: Error rendering uniform requirements: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _make_requirement_checkboxes_editable(self, editable=True):
+        """Make requirement checkboxes editable or read-only"""
+        try:
+            if hasattr(self, 'requirement_checkbox_widgets') and self.requirement_checkbox_widgets:
+                for key, checkbox_widget in self.requirement_checkbox_widgets.items():
+                    if checkbox_widget:
+                        if editable:
+                            checkbox_widget.config(state=tk.NORMAL)
+                        else:
+                            checkbox_widget.config(state=tk.DISABLED)
+                if editable:
+                    print(f"✅ Requirement checkboxes are now editable")
+                else:
+                    print(f"✅ Requirement checkboxes are now read-only")
+        except Exception as e:
+            print(f"⚠️ Error making checkboxes editable: {e}")
 
     def _update_requirements_status(self, detected_names_lower):
         """Compare detected classes to requirements and update UI labels.
@@ -12974,16 +13063,25 @@ class GuardMainControl:
                 elif is_detected or is_permanent:
                     present.add(req)
 
-            # Update listbox with checkmarks
-            if hasattr(self, 'requirements_listbox') and self.requirements_listbox:
-                self.requirements_listbox.delete(0, tk.END)
+            # Update checkboxes - check detected items (no X), uncheck missing items (X)
+            if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
                 for part in self.current_uniform_requirements:
                     key = part.lower()
-                    # Show checkmark if currently detected OR permanently checked
-                    if key in present:
-                        self.requirements_listbox.insert(tk.END, f"✓ {part}")
-                    else:
-                        self.requirements_listbox.insert(tk.END, f"◻ {part}")
+                    if key in self.requirement_checkboxes:
+                        var = self.requirement_checkboxes[key]['var']
+                        checkbox_widget = self.requirement_checkbox_widgets.get(key)
+                        
+                        # Update checkbox state based on detection
+                        if key in present:
+                            # Detected - check the checkbox (no X mark)
+                            var.set(True)
+                            if checkbox_widget:
+                                checkbox_widget.config(text=part)
+                        else:
+                            # Not detected - uncheck the checkbox (X mark)
+                            var.set(False)
+                            if checkbox_widget:
+                                checkbox_widget.config(text=f"✗ {part}")
 
             # Update status label
             if len(present) == len(required) and required:
@@ -13113,11 +13211,9 @@ class GuardMainControl:
             
             # Guard UI updates
             # requirements_status_label already shows "Incomplete uniform" (no change needed)
-            # Keep requirements section visible for 5 seconds so guard can see incomplete status
-            # Schedule hiding after 5 seconds
-            self.requirements_hide_scheduled = True
-            self.root.after(5000, self.hide_requirements_section)
-            print(f"⏱️ Requirements section will hide in 5 seconds (showing incomplete uniform status)")
+            # Keep requirements section visible - only hide when gate control button is clicked
+            # Don't schedule hiding - requirements stay visible until guard clicks a button
+            print(f"✅ Requirements section remains visible until gate control button is clicked")
             
             # Schedule violation finalization if no retry happens within 30 seconds
             # This ensures violations are finalized even if student doesn't tap again
@@ -13136,15 +13232,31 @@ class GuardMainControl:
             self._requirement_detection_counts = {}
             self._permanently_checked_requirements = set()
             
-            # CRITICAL: Enable APPROVE button when incomplete uniform is detected
-            # Store student info for APPROVE button handler (similar to approve_complete_uniform)
+            # CRITICAL: Enable APPROVE and CANCEL buttons when incomplete uniform is detected
+            # Store student info for APPROVE and CANCEL button handlers
             if hasattr(self, 'approve_button'):
                 try:
-                    self.incomplete_student_info_for_approve = student_info  # Store for APPROVE button
+                    self.incomplete_student_info_for_approve = student_info  # Store for APPROVE and CANCEL buttons
                     self.approve_button.config(state=tk.NORMAL)  # Enable APPROVE button
                     print(f"✅ APPROVE button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')}")
                 except Exception as e:
                     print(f"⚠️ WARNING: Could not enable APPROVE button: {e}")
+            
+            # Enable CANCEL button when incomplete uniform is detected
+            if hasattr(self, 'cancel_button'):
+                try:
+                    self.cancel_button.config(state=tk.NORMAL)  # Enable CANCEL button
+                    print(f"✅ CANCEL button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')}")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable CANCEL button: {e}")
+            
+            # Enable DENIED button when incomplete uniform is detected (new RFID tap)
+            if hasattr(self, 'deny_button'):
+                try:
+                    self.deny_button.config(state=tk.NORMAL)
+                    print(f"✅ DENIED button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')}")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
             
             # Reset RFID status tracker on timeout (timeout = exit, so clear entry status)
             # This ensures tapping ID again after timeout will be treated as fresh start
@@ -13158,10 +13270,7 @@ class GuardMainControl:
             # Store student info for retry button
             self.incomplete_student_info_for_retry = student_info.copy() if student_info else None
             
-            # Enable approve complete uniform button
-            if hasattr(self, 'approve_complete_uniform_btn'):
-                self.approve_complete_uniform_btn.config(state=tk.NORMAL)
-                print(f"✅ Approve Complete Uniform button enabled for incomplete uniform")
+            # Removed approve_complete_uniform_btn - use approve_button instead for incomplete uniform
             
             # Main screen updates - show incomplete uniform indicator
             self.update_main_screen_with_incomplete_uniform(student_info)
@@ -13295,6 +13404,115 @@ class GuardMainControl:
         except Exception as e:
             print(f"❌ Error handling incomplete uniform timeout: {e}")
 
+    def _schedule_complete_uniform_auto_entry(self, rfid, student_info):
+        """Schedule automatic entry after 8 seconds if guard doesn't click DENIED"""
+        try:
+            # Cancel any existing timer
+            if hasattr(self, 'complete_uniform_auto_entry_timer') and self.complete_uniform_auto_entry_timer:
+                try:
+                    self.root.after_cancel(self.complete_uniform_auto_entry_timer)
+                except Exception:
+                    pass
+            
+            # Schedule auto-entry after 8 seconds
+            def auto_entry_callback():
+                try:
+                    # Check if DENIED was clicked (would cancel auto-entry)
+                    if hasattr(self, 'denied_button_clicked') and self.denied_button_clicked:
+                        print("⏭️ Auto-entry cancelled - DENIED button was clicked")
+                        return
+                    
+                    # Check if buttons are still enabled (guard hasn't made decision)
+                    if hasattr(self, 'approve_button') and self.approve_button:
+                        button_state = str(self.approve_button.cget('state'))
+                        if button_state == 'normal':
+                            print("✅ Auto-entry triggered - 8 seconds elapsed, guard didn't click DENIED")
+                            self._execute_complete_uniform_auto_entry(rfid, student_info)
+                        else:
+                            print("⏭️ Auto-entry skipped - guard already made decision")
+                except Exception as e:
+                    print(f"⚠️ Error in auto-entry callback: {e}")
+            
+            self.complete_uniform_auto_entry_timer = self.root.after(8000, auto_entry_callback)  # 8 seconds
+            print(f"⏱️ Auto-entry scheduled for 8 seconds - guard can click DENIED to cancel")
+            self.add_activity_log("Complete uniform detected - 8 second countdown started, guard can review")
+        except Exception as e:
+            print(f"⚠️ Error scheduling auto-entry: {e}")
+    
+    def _execute_complete_uniform_auto_entry(self, rfid, student_info):
+        """Execute automatic entry for complete uniform (after 8 seconds)"""
+        try:
+            print(f"✅ Executing auto-entry for complete uniform: {student_info.get('name', 'Unknown')}")
+            
+            # Record complete uniform entry
+            self.record_complete_uniform_entry(rfid, student_info)
+            
+            # Open gate
+            self.open_gate()
+            
+            # Update gate status
+            self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+            
+            # Update main screen
+            from datetime import datetime
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            person_info = {
+                'id': rfid,
+                'name': student_info.get('name', 'Unknown Student'),
+                'type': 'student',
+                'course': student_info.get('course', 'Unknown'),
+                'gender': student_info.get('gender', 'Unknown'),
+                'timestamp': current_time,
+                'status': 'COMPLETE UNIFORM',
+                'action': 'ENTRY',
+                'guard_id': self.current_guard_id or 'Unknown'
+            }
+            
+            if self.main_screen_window and self.main_screen_window.winfo_exists():
+                self.update_main_screen_with_person(person_info)
+                self.add_to_recent_entries(person_info)
+            
+            # Show success message
+            self.show_green_success_message("Entry Approved (Auto)", 
+                              "SUCCESS: Complete uniform detected\n"
+                              "🚪 Gate is opening\n"
+                              "👤 Student may proceed\n"
+                              "✅ Auto-entry after 8 seconds")
+            
+            # Reset all button states (ACCESS GRANTED and CANCEL disabled, DENIED enabled)
+            self._reset_denied_button_state()
+            self.complete_uniform_student_info = None
+            
+            # Hide requirements section
+            self.hide_requirements_section()
+            
+            # Clear main screen after gate action
+            self.root.after(3500, self.clear_main_screen_after_gate_action)
+            
+            # Schedule status update after unlock duration
+            self.root.after(3500, self.update_gate_status_locked)
+            
+        except Exception as e:
+            print(f"⚠️ Error executing auto-entry: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def show_complete_uniform_popup_with_countdown(self, student_info):
+        """Show complete uniform popup with countdown information"""
+        try:
+            # Use existing popup method but with countdown message
+            if hasattr(self, 'show_complete_uniform_popup'):
+                self.show_complete_uniform_popup(student_info)
+            else:
+                # Fallback: show message
+                self.show_green_success_message("Complete Uniform Detected", 
+                                  "✅ Complete uniform detected\n"
+                                  "⏱️ Auto-entry in 8 seconds\n"
+                                  "🔘 Guard can click DENIED to review\n"
+                                  "🚪 Gate will open automatically")
+        except Exception as e:
+            print(f"⚠️ Error showing complete uniform popup: {e}")
+    
     def _handle_complete_uniform_detected(self):
         """Handle complete uniform detection - record entry and stop detection."""
         try:
@@ -13311,20 +13529,52 @@ class GuardMainControl:
             
             print(f"✅ Handling complete uniform for: {student_info.get('name', 'Unknown')}")
             
-            # CRITICAL: Keep APPROVE button DISABLED for complete uniform
-            # Only "APPROVE COMPLETE UNIFORM" button should be enabled for complete uniform
+            # Store student info for potential auto-entry
+            self.complete_uniform_student_info = student_info.copy() if student_info else None
+            
+            # CRITICAL: Enable all buttons for complete uniform - guard can review and decide
+            # Enable ACCESS GRANTED, CANCEL, and DENIED buttons
             if hasattr(self, 'approve_button'):
                 try:
-                    self.approve_button.config(state=tk.DISABLED)
-                    self.incomplete_student_info_for_approve = None  # Clear stored info
-                    print(f"✅ APPROVE button disabled - complete uniform detected (use 'APPROVE COMPLETE UNIFORM' button)")
+                    self.approve_button.config(state=tk.NORMAL)
+                    print(f"✅ APPROVE button enabled - complete uniform detected, guard can review")
                 except Exception as e:
-                    print(f"⚠️ WARNING: Could not disable APPROVE button: {e}")
+                    print(f"⚠️ WARNING: Could not enable APPROVE button: {e}")
             
-            # Record complete uniform entry (automatic entry)
-            self.record_complete_uniform_entry(rfid, student_info)
+            if hasattr(self, 'cancel_button'):
+                try:
+                    self.cancel_button.config(state=tk.NORMAL)
+                    print(f"✅ CANCEL button enabled - complete uniform detected, guard can review")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable CANCEL button: {e}")
             
-            # Update main screen to show ENTRY status (complete uniform)
+            # Reset denied button state flags first (but don't disable - will enable after reset)
+            self.denied_button_clicked = False
+            self.original_detection_state = None
+            self.original_uniform_status = None
+            
+            # Reset DENIED button text and command to original
+            if hasattr(self, 'deny_button') and self.deny_button:
+                self.deny_button.config(
+                    text="DENIED\n(Keep Locked)",
+                    command=self.handle_interface_deny
+                )
+            
+            # Enable DENIED button when complete uniform is detected (new RFID tap)
+            if hasattr(self, 'deny_button'):
+                try:
+                    self.deny_button.config(state=tk.NORMAL)
+                    print(f"✅ DENIED button enabled - complete uniform detected, guard can review")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+            
+            # Make checkboxes read-only initially (will become editable if DENIED clicked)
+            self._make_requirement_checkboxes_editable(False)
+            
+            # Schedule auto-entry after 8 seconds (if guard doesn't click DENIED)
+            self._schedule_complete_uniform_auto_entry(rfid, student_info)
+            
+            # Update main screen to show COMPLETE UNIFORM status (waiting for guard decision)
             from datetime import datetime
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             person_info = {
@@ -13334,30 +13584,26 @@ class GuardMainControl:
                 'course': student_info.get('course', 'Unknown'),
                 'gender': student_info.get('gender', 'Unknown'),
                 'timestamp': current_time,
-                'status': 'COMPLETE UNIFORM',  # This will be displayed as ENTRY in update_main_screen_with_person
-                'action': 'ENTRY',  # Set action to ENTRY for logging
+                'status': 'COMPLETE UNIFORM',  # Will show as complete uniform, waiting for guard
+                'action': 'DETECTING',  # Not yet entry - waiting for guard decision
                 'guard_id': self.current_guard_id or 'Unknown'
             }
             # Mark uniform detection as complete
             self.uniform_detection_complete = True
             if self.main_screen_window and self.main_screen_window.winfo_exists():
                 self.update_main_screen_with_person(person_info)
-                # NOW log entry to recent entries - only after complete uniform
-                self.add_to_recent_entries(person_info)
             
-            # Show complete uniform popup
-            self.show_complete_uniform_popup(student_info)
+            # Show complete uniform popup with countdown info
+            self.show_complete_uniform_popup_with_countdown(student_info)
             
             # Stop detection stream
             if hasattr(self, 'external_detection_stop_event') and self.external_detection_stop_event:
                 self.external_detection_stop_event.set()
                 print(f"🛑 Stopping detection stream - uniform complete")
             
-            # Keep requirements section visible for 5 seconds so guard can see complete status
-            # Schedule hiding after 5 seconds
-            self.requirements_hide_scheduled = True
-            self.root.after(5000, self.hide_requirements_section)
-            print(f"⏱️ Requirements section will hide in 5 seconds (showing complete uniform status)")
+            # Keep requirements section visible - only hide when gate control button is clicked
+            # Don't schedule hiding - requirements stay visible until guard clicks a button
+            print(f"✅ Requirements section remains visible until gate control button is clicked")
             
             # Reset detection tracking variables
             self._requirement_detection_counts = {}
@@ -13365,8 +13611,7 @@ class GuardMainControl:
             
             # Clear incomplete student info and disable approve complete uniform button since uniform is now complete
             self.incomplete_student_info_for_retry = None
-            if hasattr(self, 'approve_complete_uniform_btn'):
-                self.approve_complete_uniform_btn.config(state=tk.DISABLED)
+            # Removed approve_complete_uniform_btn - no longer needed
             
             # Re-enable ID input field - detection completed (complete uniform)
             if hasattr(self, 'person_id_entry'):
@@ -13431,14 +13676,15 @@ class GuardMainControl:
                               "🚪 Gate is opening\n"
                               "👤 Student may proceed")
             
-            # CRITICAL: Disable BOTH buttons after processing
-            if hasattr(self, 'approve_complete_uniform_btn'):
-                self.approve_complete_uniform_btn.config(state=tk.DISABLED)
-                print(f"✅ APPROVE COMPLETE UNIFORM button disabled after processing")
-            
+            # CRITICAL: Disable buttons after processing
+            # Removed approve_complete_uniform_btn - no longer needed
             if hasattr(self, 'approve_button'):
                 self.approve_button.config(state=tk.DISABLED)
                 print(f"✅ APPROVE button disabled after processing")
+            
+            if hasattr(self, 'cancel_button'):
+                self.cancel_button.config(state=tk.DISABLED)
+                print(f"✅ CANCEL button disabled after processing")
             
             # Clear incomplete student info
             self.incomplete_student_info_for_retry = None
@@ -13593,13 +13839,9 @@ class GuardMainControl:
             stale_after = 1.5
             now_ts = time.time()
             is_stale = (now_ts - getattr(self, '_last_detect_time', 0.0)) > stale_after
-            if is_stale and hasattr(self, 'detected_classes_listbox') and self.detected_classes_listbox:
-                try:
-                    self.detected_classes_listbox.delete(0, tk.END)
-                    self.detected_classes_listbox.insert(tk.END, "No detection")
-                    self._last_detected_classes = []
-                except Exception:
-                    pass
+            # Removed detected_classes_listbox - detections now go to activity log
+            if is_stale:
+                self._last_detected_classes = []
         except Exception:
             pass
         finally:
@@ -13675,10 +13917,30 @@ class GuardMainControl:
         # Store incomplete student info for APPROVE button (similar to approve_complete_uniform)
         self.incomplete_student_info_for_approve = None
         
+        # Cancel button - DISABLED by default, only enabled after incomplete uniform or DENIED clicked
+        self.cancel_button = tk.Button(
+            buttons_frame,
+            text="CANCEL",
+            font=('Arial', 9, 'bold'),
+            bg='#6b7280',
+            fg='white',
+            disabledforeground='#d1d5db',  # Light gray text when disabled - ensures text is visible
+            relief='raised',
+            bd=2,
+            padx=5,
+            pady=6,
+            cursor='hand2',
+            activebackground='#4b5563',
+            activeforeground='white',
+            command=self.handle_interface_cancel,
+            state=tk.DISABLED  # Disabled by default - only enabled after incomplete uniform or DENIED clicked
+        )
+        self.cancel_button.pack(side=tk.LEFT, padx=(2, 2), fill=tk.X, expand=True)
+        
         # Deny button
         self.deny_button = tk.Button(
             buttons_frame,
-            text="ACCESS DENIED\n(Keep Locked)",
+            text="DENIED\n(Keep Locked)",
             font=('Arial', 9, 'bold'),
             bg='#dc2626',
             fg='white',
@@ -13691,44 +13953,7 @@ class GuardMainControl:
             activeforeground='white',
             command=self.handle_interface_deny
         )
-        self.deny_button.pack(side=tk.LEFT, padx=(2, 2), fill=tk.X, expand=True)
-        
-        # Approve Complete Uniform button
-        self.approve_complete_uniform_btn = tk.Button(
-            buttons_frame,
-            text="ACCESS GRANTED\nCOMPLETE UNIFORM",
-            font=('Arial', 9, 'bold'),
-            bg='#10b981',  # Green color for approval
-            fg='white',
-            relief='raised',
-            bd=2,
-            padx=5,
-            pady=6,
-            cursor='hand2',
-            activebackground='#059669',
-            activeforeground='white',
-            command=self.approve_complete_uniform,
-            state=tk.DISABLED  # Initially disabled
-        )
-        self.approve_complete_uniform_btn.pack(side=tk.LEFT, padx=(2, 2), fill=tk.X, expand=True)
-        
-        # Event Mode toggle button - make sure it's visible
-        self.event_mode_btn = tk.Button(
-            buttons_frame,
-            text="Event Mode:\nOFF",
-            font=('Arial', 9, 'bold'),
-            bg='#9ca3af',  # Gray when OFF
-            fg='white',
-            relief='raised',
-            bd=2,
-            padx=5,
-            pady=6,
-            cursor='hand2',
-            activebackground='#6b7280',
-            activeforeground='white',
-            command=self.toggle_event_mode
-        )
-        self.event_mode_btn.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+        self.deny_button.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
         
         # Instructions
         instructions_label = tk.Label(
@@ -13741,35 +13966,222 @@ class GuardMainControl:
         )
         instructions_label.pack(pady=(0, 10))
     
+    def clear_main_screen_after_gate_action(self):
+        """Clear main screen after gate control button is clicked"""
+        try:
+            # Cancel any pending auto-clear timer
+            if hasattr(self, 'main_screen_clear_timer') and self.main_screen_clear_timer is not None:
+                try:
+                    self.root.after_cancel(self.main_screen_clear_timer)
+                except Exception:
+                    pass
+                self.main_screen_clear_timer = None
+            
+            # Clear violation flags so main screen can be cleared
+            self.incomplete_student_info_for_approve = None
+            
+            # Reset denied button state
+            self._reset_denied_button_state()
+            
+            # Make checkboxes read-only
+            self._make_requirement_checkboxes_editable(False)
+            
+            # Clear all widgets from person display frame
+            if hasattr(self, 'person_display_frame'):
+                for widget in self.person_display_frame.winfo_children():
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
+            
+            # Return to standby mode
+            if self.main_screen_window and self.main_screen_window.winfo_exists():
+                self.show_standby_message()
+            
+            print(f"✅ Main screen cleared after gate control action")
+        except Exception as e:
+            print(f"⚠️ Error clearing main screen after gate action: {e}")
+    
     def handle_interface_approve(self):
         """Handle approve button press from interface"""
         try:
-            print("SUCCESS: Interface Approve button pressed - Unlocking gate")
-            self.add_activity_log("Interface Approve button pressed - Unlocking gate")
+            # Check if DENIED was clicked (either complete or incomplete uniform scenario)
+            is_denied_clicked_scenario = (
+                hasattr(self, 'denied_button_clicked') and 
+                self.denied_button_clicked
+            )
             
-            # CRITICAL: Call handle_approve_button() to save entry to Firebase, update main screen, and add to recent entries
-            entry_saved = self.handle_approve_button()
+            # Check if this is complete uniform scenario (after DENIED clicked)
+            is_complete_uniform_scenario = (
+                is_denied_clicked_scenario and
+                hasattr(self, 'original_uniform_status') and 
+                self.original_uniform_status == 'complete'
+            )
             
-            if entry_saved:
-                print(f"✅ Entry saved successfully via handle_approve_button()")
+            # Check if this is incomplete uniform scenario (after DENIED clicked)
+            is_incomplete_uniform_scenario = (
+                is_denied_clicked_scenario and
+                hasattr(self, 'original_uniform_status') and 
+                self.original_uniform_status == 'incomplete'
+            )
+            
+            if is_complete_uniform_scenario:
+                # Complete uniform scenario: Entry with violation (incorrect uniform)
+                print("SUCCESS: Interface Approve button pressed - Entry with violation (complete uniform scenario)")
+                self.add_activity_log("Interface Approve button pressed - Entry with violation (complete uniform)")
+                
+                # Get student info
+                student_info = None
+                current_rfid = None
+                
+                if hasattr(self, 'complete_uniform_student_info') and self.complete_uniform_student_info:
+                    student_info = self.complete_uniform_student_info
+                    current_rfid = student_info.get('rfid')
+                
+                if not current_rfid and hasattr(self, 'current_rfid_for_timer'):
+                    current_rfid = self.current_rfid_for_timer
+                
+                if not student_info and current_rfid:
+                    student_info = self.get_student_info_by_rfid(current_rfid)
+                
+                if not current_rfid or not student_info:
+                    print(f"⚠️ WARNING: Cannot process APPROVE - missing RFID or student info")
+                    messagebox.showerror("Error", "Cannot process approve - missing student information")
+                    return
+                
+                # Entry with violation (guard sees problem)
+                entry_saved = self.handle_approve_button()
+                
+                if entry_saved:
+                    print(f"✅ Entry with violation saved successfully")
+                else:
+                    print(f"⚠️ WARNING: Entry may not have been saved")
+                
+                # Send approve command to Arduino
+                self.send_arduino_command("APPROVE")
+                
+                # Open gate
+                self.open_gate()
+                
+                # Update gate status
+                self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+                
+                # Show success message
+                self.show_green_success_message("Entry Approved (With Violation)", 
+                                  "SUCCESS: Entry recorded with violation\n"
+                                  "🚪 Gate is opening\n"
+                                  "👤 Student may proceed\n"
+                                  "⚠️ Violation recorded")
+                
+                # Update main screen
+                if self.main_screen_window and self.main_screen_window.winfo_exists():
+                    self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (WITH VIOLATION)")
+            elif is_incomplete_uniform_scenario:
+                # Incomplete uniform scenario after DENIED clicked: Entry with violation
+                print("SUCCESS: Interface Approve button pressed - Entry with violation (incomplete uniform after DENIED)")
+                self.add_activity_log("Interface Approve button pressed - Entry with violation (incomplete uniform after DENIED)")
+                
+                # Get student info
+                student_info = None
+                current_rfid = None
+                
+                if hasattr(self, 'incomplete_student_info_for_approve') and self.incomplete_student_info_for_approve:
+                    student_info = self.incomplete_student_info_for_approve
+                    current_rfid = student_info.get('rfid')
+                
+                if not current_rfid and hasattr(self, 'current_rfid_for_timer'):
+                    current_rfid = self.current_rfid_for_timer
+                
+                if not student_info and current_rfid:
+                    student_info = self.get_student_info_by_rfid(current_rfid)
+                
+                if not current_rfid or not student_info:
+                    print(f"⚠️ WARNING: Cannot process APPROVE - missing RFID or student info")
+                    messagebox.showerror("Error", "Cannot process approve - missing student information")
+                    return
+                
+                # Entry with violation (guard sees problem with incomplete uniform)
+                entry_saved = self.handle_approve_button()
+                
+                if entry_saved:
+                    print(f"✅ Entry with violation saved successfully")
+                else:
+                    print(f"⚠️ WARNING: Entry may not have been saved")
+                
+                # Send approve command to Arduino
+                self.send_arduino_command("APPROVE")
+                
+                # Open gate
+                self.open_gate()
+                
+                # Update gate status
+                self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+                
+                # Show success message
+                self.show_green_success_message("Entry Approved (With Violation)", 
+                                  "SUCCESS: Entry recorded with violation\n"
+                                  "🚪 Gate is opening\n"
+                                  "👤 Student may proceed\n"
+                                  "⚠️ Violation recorded")
+                
+                # Update main screen
+                if self.main_screen_window and self.main_screen_window.winfo_exists():
+                    self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (WITH VIOLATION)")
             else:
-                print(f"⚠️ WARNING: handle_approve_button() returned False - entry may not have been saved")
+                # Normal incomplete uniform scenario (DENIED not clicked)
+                print("SUCCESS: Interface Approve button pressed - Unlocking gate")
+                self.add_activity_log("Interface Approve button pressed - Unlocking gate")
+                
+                # CRITICAL: Call handle_approve_button() to save entry to Firebase, update main screen, and add to recent entries
+                entry_saved = self.handle_approve_button()
+                
+                if entry_saved:
+                    print(f"✅ Entry saved successfully via handle_approve_button()")
+                else:
+                    print(f"⚠️ WARNING: handle_approve_button() returned False - entry may not have been saved")
+                
+                # Send approve command to Arduino
+                self.send_arduino_command("APPROVE")
+                
+                # Open gate
+                self.open_gate()
+                
+                # Update gate status
+                self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+                
+                # Show success message
+                self.show_green_success_message("Gate Approved", 
+                                  "SUCCESS: Gate is unlocking\n"
+                                  "🚪 Person may proceed\n"
+                                  "✅ Entry recorded with violation")
+                
+                # Update main screen (handle_approve_button already updates it, but this ensures gate status is updated)
+                if self.main_screen_window and self.main_screen_window.winfo_exists():
+                    self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED")
             
-            # Send approve command to Arduino
-            self.send_arduino_command("APPROVE")
+            # Reset all button states after processing
+            self._reset_denied_button_state()
             
-            # Update gate status
-            self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+            # Make checkboxes read-only again
+            self._make_requirement_checkboxes_editable(False)
             
-            # Show success message
-            self.show_green_success_message("Gate Approved", 
-                              "SUCCESS: Gate is unlocking\n"
-                              "🚪 Person may proceed\n"
-                              "⏰ Auto-lock in 3 seconds")
+            # Cancel auto-entry timer if exists
+            if hasattr(self, 'complete_uniform_auto_entry_timer') and self.complete_uniform_auto_entry_timer:
+                try:
+                    self.root.after_cancel(self.complete_uniform_auto_entry_timer)
+                    self.complete_uniform_auto_entry_timer = None
+                except Exception:
+                    pass
             
-            # Update main screen (handle_approve_button already updates it, but this ensures gate status is updated)
-            if self.main_screen_window and self.main_screen_window.winfo_exists():
-                self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED")
+            # Reset pending operations
+            self.incomplete_student_info_for_approve = None
+            self.complete_uniform_student_info = None
+            
+            # Hide requirements section after gate control action
+            self.hide_requirements_section()
+            
+            # Clear main screen after gate control action (violation resolved)
+            self.clear_main_screen_after_gate_action()
             
             # Schedule status update after unlock duration
             self.root.after(3500, self.update_gate_status_locked)
@@ -13777,32 +14189,424 @@ class GuardMainControl:
         except Exception as e:
             print(f"ERROR: Error handling interface approve: {e}")
             self.add_activity_log(f"Error handling interface approve: {e}")
+            import traceback
+            traceback.print_exc()
     
-    def handle_interface_deny(self):
-        """Handle deny button press from interface"""
+    def handle_interface_cancel(self):
+        """Handle cancel button press - Three functions:
+        1. If denied_button_clicked (complete uniform): Permanently lock gate and return to standby
+        2. If denied_button_clicked (incomplete uniform): Lock gate and return to standby
+        3. If not: Entry without violation (bypass incomplete uniform)
+        """
         try:
-            print("ERROR: Interface Deny button pressed - Keeping gate locked")
-            self.add_activity_log("Interface Deny button pressed - Keeping gate locked")
+            # Check if DENIED was clicked - if so, lock gate and return to standby
+            if hasattr(self, 'denied_button_clicked') and self.denied_button_clicked:
+                is_complete_uniform = (
+                    hasattr(self, 'original_uniform_status') and 
+                    self.original_uniform_status == 'complete'
+                )
+                
+                if is_complete_uniform:
+                    print("INFO: Cancel button pressed after DENIED (complete uniform) - Permanently locking gate and returning to standby")
+                    self.add_activity_log("Cancel button pressed after DENIED (complete uniform) - Permanently locking gate, returning to standby")
+                else:
+                    print("INFO: Cancel button pressed after DENIED - Locking gate and returning to standby")
+                    self.add_activity_log("Cancel button pressed after DENIED - Locking gate, returning to standby")
+                
+                # Send deny command to Arduino (keep gate locked)
+                self.send_arduino_command("DENY")
+                
+                # Update gate status
+                self.gate_status_label.config(text="🔒 Gate: Locked", fg='#dc2626')
+                
+                # Cancel auto-entry timer if exists
+                if hasattr(self, 'complete_uniform_auto_entry_timer') and self.complete_uniform_auto_entry_timer:
+                    try:
+                        self.root.after_cancel(self.complete_uniform_auto_entry_timer)
+                        self.complete_uniform_auto_entry_timer = None
+                    except Exception:
+                        pass
+                
+                # Reset all button states
+                self._reset_denied_button_state()
+                
+                # Make checkboxes read-only again
+                self._make_requirement_checkboxes_editable(False)
+                
+                # Reset pending operations
+                self.incomplete_student_info_for_approve = None
+                self.complete_uniform_student_info = None
+                
+                # Hide requirements section
+                self.hide_requirements_section()
+                
+                # Clear main screen and return to standby
+                self.clear_main_screen_after_gate_action()
+                
+                # Show info message
+                if is_complete_uniform:
+                    self.show_green_success_message("Gate Permanently Locked", 
+                                      "Gate is permanently locked\n"
+                                      "❌ Entry cancelled\n"
+                                      "🔄 Returned to standby")
+                else:
+                    self.show_green_success_message("Gate Locked", 
+                                      "Gate is locked\n"
+                                      "❌ Entry cancelled\n"
+                                      "🔄 Returned to standby")
+                
+                return
             
-            # Send deny command to Arduino
-            self.send_arduino_command("DENY")
+            # Default behavior: Entry without violation (bypass incomplete uniform)
+            print("SUCCESS: Cancel button pressed - Entry without violation (overriding incomplete uniform)")
+            self.add_activity_log("Cancel button pressed - Entry without violation")
+            
+            # Get student info from stored incomplete student info
+            student_info = None
+            current_rfid = None
+            
+            if hasattr(self, 'incomplete_student_info_for_approve') and self.incomplete_student_info_for_approve:
+                student_info = self.incomplete_student_info_for_approve
+                current_rfid = student_info.get('rfid')
+                print(f"✅ Using stored incomplete student info for CANCEL: {student_info.get('name', 'Unknown')}")
+            
+            # Fallback: Get current student info from detection system
+            if not current_rfid:
+                if hasattr(self, 'detection_system') and self.detection_system:
+                    detection_service = getattr(self.detection_system, 'detection_service', None)
+                    if detection_service:
+                        current_rfid = getattr(detection_service, 'current_rfid', None)
+            
+            # Try backup RFID storage
+            if not current_rfid and hasattr(self, 'current_rfid_for_timer'):
+                current_rfid = self.current_rfid_for_timer
+            
+            # If we don't have student_info yet, fetch it
+            if not student_info and current_rfid:
+                student_info = self.get_student_info_by_rfid(current_rfid)
+            
+            # Check if we have student info and RFID to proceed
+            if not current_rfid or not student_info:
+                print(f"⚠️ WARNING: Cannot process CANCEL - missing RFID or student info")
+                messagebox.showerror("Error", "Cannot process cancel - missing student information")
+                return
+            
+            # CRITICAL: Record entry as COMPLETE UNIFORM (no violation)
+            # This clears violations and allows entry without violation
+            self.record_complete_uniform_entry(current_rfid, student_info)
+            
+            # Open gate (same as complete uniform)
+            self.open_gate()
             
             # Update gate status
-            self.gate_status_label.config(text="🔒 Gate: Locked", fg='#dc2626')
+            self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
             
-            # Show warning message
-            self.show_red_warning_message("Gate Denied", 
-                              "ERROR: Gate remains locked\n"
-                              "🚪 Person must correct uniform\n"
-                              "👤 Check uniform requirements")
+            # Show success message
+            self.show_green_success_message("Entry Approved (No Violation)", 
+                              "SUCCESS: Entry recorded without violation\n"
+                              "🚪 Gate is opening\n"
+                              "👤 Student may proceed\n"
+                              "✅ Uniform violation overridden")
             
             # Update main screen
             if self.main_screen_window and self.main_screen_window.winfo_exists():
-                self.update_main_screen_with_gate_status("LOCKED", "DENIED")
+                self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (NO VIOLATION)")
             
+            # Disable buttons after processing
+            if hasattr(self, 'approve_button') and self.approve_button:
+                self.approve_button.config(state=tk.DISABLED)
+            if hasattr(self, 'cancel_button') and self.cancel_button:
+                self.cancel_button.config(state=tk.DISABLED)
+            
+            # Reset pending operations
+            self.incomplete_student_info_for_approve = None
+            
+            # Hide requirements section
+            self.hide_requirements_section()
+            
+            # Clear main screen after gate control action
+            self.clear_main_screen_after_gate_action()
+            
+            # Schedule status update after unlock duration
+            self.root.after(3500, self.update_gate_status_locked)
+            
+        except Exception as e:
+            print(f"ERROR: Error handling interface cancel: {e}")
+            self.add_activity_log(f"Error handling interface cancel: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def handle_interface_deny(self):
+        """Handle deny button press - toggles to GRANTED and makes checkboxes editable"""
+        try:
+            # Check if this is first click (toggle to GRANTED) or second click (already GRANTED)
+            if not self.denied_button_clicked:
+                # First click - toggle to GRANTED
+                print("INFO: Interface Deny button pressed - Toggling to GRANTED, waiting for guard decision")
+                self.add_activity_log("Deny button pressed - Toggled to GRANTED, waiting for guard decision")
+                
+                # Cancel auto-entry timer if it exists (complete uniform scenario)
+                if hasattr(self, 'complete_uniform_auto_entry_timer') and self.complete_uniform_auto_entry_timer:
+                    try:
+                        self.root.after_cancel(self.complete_uniform_auto_entry_timer)
+                        self.complete_uniform_auto_entry_timer = None
+                        print("✅ Auto-entry timer cancelled - guard clicked DENIED")
+                    except Exception:
+                        pass
+                
+                # Cancel any existing main screen auto-clear timer (prevent premature clearing)
+                if hasattr(self, 'main_screen_clear_timer') and self.main_screen_clear_timer is not None:
+                    try:
+                        self.root.after_cancel(self.main_screen_clear_timer)
+                        self.main_screen_clear_timer = None
+                        print("✅ Cancelled main screen auto-clear timer - DENIED clicked, waiting for guard decision")
+                    except Exception:
+                        pass
+                
+                # Store original detection state
+                self.denied_button_clicked = True
+                self.original_detection_state = self.uniform_detection_complete
+                
+                # Determine original uniform status
+                if self.uniform_detection_complete:
+                    self.original_uniform_status = 'complete'
+                elif hasattr(self, 'incomplete_student_info_for_approve') and self.incomplete_student_info_for_approve:
+                    self.original_uniform_status = 'incomplete'
+                else:
+                    # Check if there are active violations
+                    if hasattr(self, 'active_session_violations') and self.active_session_violations:
+                        current_rfid = getattr(self, 'current_rfid_for_timer', None)
+                        if current_rfid and current_rfid in self.active_session_violations:
+                            self.original_uniform_status = 'incomplete'
+                        else:
+                            self.original_uniform_status = 'complete'
+                    else:
+                        self.original_uniform_status = 'complete'
+                
+                # Toggle button text from DENIED to GRANTED
+                if hasattr(self, 'deny_button') and self.deny_button:
+                    self.deny_button.config(
+                        text="GRANTED\n(Unlock Gate)",
+                        command=self.handle_interface_granted_after_deny
+                    )
+                    print(f"✅ DENIED button toggled to GRANTED")
+                
+                # Make requirement checkboxes editable
+                self._make_requirement_checkboxes_editable(True)
+                
+                # Stop detection immediately when DENIED is clicked during detection
+                if hasattr(self, 'detection_active') and self.detection_active:
+                    print("🛑 Stopping detection - DENIED button clicked during detection")
+                    self.detection_active = False
+                    
+                    # Stop detection system
+                    if hasattr(self, 'detection_system') and self.detection_system:
+                        try:
+                            self.detection_system.stop_detection()
+                            print("✅ Detection system stopped")
+                        except Exception as e:
+                            print(f"⚠️ Error stopping detection system: {e}")
+                    
+                    # Stop external detection stop event
+                    if hasattr(self, 'external_detection_stop_event') and self.external_detection_stop_event:
+                        try:
+                            self.external_detection_stop_event.set()
+                            print("✅ External detection stop event set")
+                        except Exception as e:
+                            print(f"⚠️ Error setting stop event: {e}")
+                
+                # Ensure all buttons are enabled (for complete uniform scenario)
+                if hasattr(self, 'approve_button') and self.approve_button:
+                    self.approve_button.config(state=tk.NORMAL)
+                if hasattr(self, 'cancel_button') and self.cancel_button:
+                    self.cancel_button.config(state=tk.NORMAL)
+                
+                # Send deny command to Arduino (keep gate locked)
+                self.send_arduino_command("DENY")
+                
+                # Update gate status
+                self.gate_status_label.config(text="🔒 Gate: Locked (Pending Decision)", fg='#f59e0b')
+                
+                # Get current student info to display HOLD status
+                student_info = None
+                current_rfid = None
+                
+                if hasattr(self, 'current_student_info_for_timer') and self.current_student_info_for_timer:
+                    student_info = self.current_student_info_for_timer
+                    current_rfid = student_info.get('rfid') or student_info.get('id')
+                elif hasattr(self, 'complete_uniform_student_info') and self.complete_uniform_student_info:
+                    student_info = self.complete_uniform_student_info
+                    current_rfid = student_info.get('rfid')
+                elif hasattr(self, 'incomplete_student_info_for_approve') and self.incomplete_student_info_for_approve:
+                    student_info = self.incomplete_student_info_for_approve
+                    current_rfid = student_info.get('rfid')
+                
+                if not current_rfid and hasattr(self, 'current_rfid_for_timer'):
+                    current_rfid = self.current_rfid_for_timer
+                
+                if not student_info and current_rfid:
+                    student_info = self.get_student_info_by_rfid(current_rfid)
+                
+                # Update main screen with HOLD status (keep student info visible)
+                if student_info and self.main_screen_window and self.main_screen_window.winfo_exists():
+                    from datetime import datetime
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    person_info = {
+                        'id': current_rfid or student_info.get('student_id', ''),
+                        'name': student_info.get('name', 'Unknown Student'),
+                        'type': 'student',
+                        'course': student_info.get('course', 'Unknown'),
+                        'gender': student_info.get('gender', 'Unknown'),
+                        'timestamp': current_time,
+                        'status': 'HOLD',  # Display HOLD status
+                        'action': 'HOLD',
+                        'guard_id': self.current_guard_id or 'Unknown'
+                    }
+                    self.update_main_screen_with_person(person_info)
+                    print(f"✅ Main screen updated with HOLD status for {student_info.get('name', 'Unknown')}")
+                
+                # Keep requirements section visible (don't hide it)
+                print(f"✅ Requirements section remains visible - waiting for guard decision")
+                
+                # Show info message
+                self.show_green_success_message("Pending Guard Decision", 
+                                  "Gate is locked - waiting for guard decision\n"
+                                  "✅ Detection stopped\n"
+                                  "✅ Checkboxes are now editable\n"
+                                  "👤 Review uniform requirements\n"
+                                  "🔘 Click GRANTED or ACCESS GRANTED to approve\n"
+                                  "❌ Click CANCEL to lock and return to standby")
+                
+            else:
+                # Already toggled - should not happen, but handle gracefully
+                print("⚠️ DENIED button already toggled to GRANTED")
+                
         except Exception as e:
             print(f"ERROR: Error handling interface deny: {e}")
             self.add_activity_log(f"Error handling interface deny: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def handle_interface_granted_after_deny(self):
+        """Handle GRANTED button (formerly DENIED) - entry based on original detection state"""
+        try:
+            print("SUCCESS: GRANTED button pressed (after DENIED) - Processing entry based on original detection")
+            self.add_activity_log("GRANTED button pressed (after DENIED) - Processing entry")
+            
+            # Get student info
+            student_info = None
+            current_rfid = None
+            
+            # Check for complete uniform scenario first
+            if hasattr(self, 'complete_uniform_student_info') and self.complete_uniform_student_info:
+                student_info = self.complete_uniform_student_info
+                current_rfid = student_info.get('rfid')
+            
+            # Fallback: incomplete uniform scenario
+            if not student_info:
+                if hasattr(self, 'incomplete_student_info_for_approve') and self.incomplete_student_info_for_approve:
+                    student_info = self.incomplete_student_info_for_approve
+                    current_rfid = student_info.get('rfid')
+            
+            # Fallback: Get current student info
+            if not current_rfid:
+                if hasattr(self, 'detection_system') and self.detection_system:
+                    detection_service = getattr(self.detection_system, 'detection_service', None)
+                    if detection_service:
+                        current_rfid = getattr(detection_service, 'current_rfid', None)
+            
+            if not current_rfid and hasattr(self, 'current_rfid_for_timer'):
+                current_rfid = self.current_rfid_for_timer
+            
+            if not student_info and current_rfid:
+                student_info = self.get_student_info_by_rfid(current_rfid)
+            
+            if not current_rfid or not student_info:
+                print(f"⚠️ WARNING: Cannot process GRANTED - missing RFID or student info")
+                messagebox.showerror("Error", "Cannot process granted - missing student information")
+                return
+            
+            # GRANTED button (formerly DENIED) always records entry WITHOUT violation
+            # Regardless of original detection state, GRANTED = entry without violation
+            print(f"✅ GRANTED button clicked - recording entry WITHOUT violation (bypassing incomplete uniform)")
+            self.record_complete_uniform_entry(current_rfid, student_info)
+            
+            # Open gate
+            self.open_gate()
+            
+            # Update gate status
+            self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+            
+            # Show success message - GRANTED always means no violation
+            self.show_green_success_message("Entry Approved (No Violation)", 
+                              "SUCCESS: Entry recorded WITHOUT violation\n"
+                              "🚪 Gate is opening\n"
+                              "👤 Student may proceed\n"
+                              "✅ Uniform violation bypassed")
+            
+            # Update main screen
+            if self.main_screen_window and self.main_screen_window.winfo_exists():
+                self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (NO VIOLATION)")
+            
+            # Cancel auto-entry timer if exists
+            if hasattr(self, 'complete_uniform_auto_entry_timer') and self.complete_uniform_auto_entry_timer:
+                try:
+                    self.root.after_cancel(self.complete_uniform_auto_entry_timer)
+                    self.complete_uniform_auto_entry_timer = None
+                except Exception:
+                    pass
+            
+            # Reset all button states (ACCESS GRANTED and CANCEL disabled, DENIED enabled)
+            self._reset_denied_button_state()
+            
+            # Reset pending operations
+            self.complete_uniform_student_info = None
+            
+            # Make checkboxes read-only again
+            self._make_requirement_checkboxes_editable(False)
+            
+            # Hide requirements section
+            self.hide_requirements_section()
+            
+            # Clear main screen after gate control action
+            self.clear_main_screen_after_gate_action()
+            
+            # Schedule status update after unlock duration
+            self.root.after(3500, self.update_gate_status_locked)
+            
+        except Exception as e:
+            print(f"ERROR: Error handling interface granted after deny: {e}")
+            self.add_activity_log(f"Error handling interface granted after deny: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _reset_denied_button_state(self):
+        """Reset DENIED button to original state and disable all gate control buttons"""
+        try:
+            self.denied_button_clicked = False
+            self.original_detection_state = None
+            self.original_uniform_status = None
+            
+            # Reset DENIED button text and command, but DISABLE it (will be enabled only when new RFID is tapped)
+            if hasattr(self, 'deny_button') and self.deny_button:
+                self.deny_button.config(
+                    text="DENIED\n(Keep Locked)",
+                    command=self.handle_interface_deny,
+                    state=tk.DISABLED  # Disabled - will be enabled only when new RFID is tapped
+                )
+                print(f"✅ DENIED button reset to original state (disabled - waiting for new RFID tap)")
+            
+            # Disable ACCESS GRANTED button
+            if hasattr(self, 'approve_button') and self.approve_button:
+                self.approve_button.config(state=tk.DISABLED)
+                print(f"✅ ACCESS GRANTED button disabled")
+            
+            # Disable CANCEL button
+            if hasattr(self, 'cancel_button') and self.cancel_button:
+                self.cancel_button.config(state=tk.DISABLED)
+                print(f"✅ CANCEL button disabled")
+        except Exception as e:
+            print(f"⚠️ Error resetting denied button state: {e}")
     
     def update_gate_status_locked(self):
         """Update gate status to locked after auto-lock"""
@@ -13832,7 +14636,7 @@ class GuardMainControl:
         """Create activity logs section"""
         logs_frame = tk.LabelFrame(
             parent,
-            text="Activity Logs",
+            text="Activity Log",
             font=('Arial', 14, 'bold'),
             fg='#374151',
             bg='#ffffff',
@@ -14334,6 +15138,10 @@ class GuardMainControl:
             status_text = person_info.get('status', 'DETECTING')
             status_color = '#ef4444'  # Default red
             
+            # Check for HOLD status first (when DENIED is clicked during detection) - takes priority
+            is_hold_status = (person_info.get('status', '').upper() == 'HOLD' or 
+                            person_info.get('action', '').upper() == 'HOLD')
+            
             if person_info.get('type', '').lower() == 'student':
                 # Check if this is temporary RFID (forgot ID) - skip detection, show ENTRY immediately
                 is_temporary_rfid = person_info.get('temporary_rfid', False) or person_info.get('skip_detection', False)
@@ -14408,6 +15216,12 @@ class GuardMainControl:
                         else:
                             status_text = "DETECTING"
                             status_color = '#f59e0b'  # Orange/amber
+                
+                # Override with HOLD status if applicable (takes priority over all other statuses for students)
+                if is_hold_status:
+                    status_text = "HOLD"
+                    status_color = '#f59e0b'  # Orange/amber for hold status
+                    print(f"✅ HOLD status detected - displaying HOLD status (priority override)")
             else:
                 # For non-students (visitors/teachers), use original logic
                 if person_info.get('status') == 'TIME-IN' or person_info.get('status') == 'ENTRY':
@@ -14419,6 +15233,12 @@ class GuardMainControl:
                 else:
                     status_text = person_info.get('status', 'DETECTING')
                     status_color = '#f59e0b'  # Orange/amber
+                
+                # Override with HOLD status if applicable (for non-students too)
+                if is_hold_status:
+                    status_text = "HOLD"
+                    status_color = '#f59e0b'  # Orange/amber for hold status
+                    print(f"✅ HOLD status detected - displaying HOLD status (priority override)")
             
             # Create left panel (Picture) - 66% width
             picture_frame = tk.Frame(top_container, bg='#ffffff', relief='solid', bd=1)
@@ -14697,8 +15517,28 @@ class GuardMainControl:
             print(f"ERROR: Error updating main screen: {e}")
     
     def _schedule_main_screen_clear(self):
-        """Schedule clearing the main screen after 15 seconds"""
+        """Schedule clearing the main screen after 15 seconds, but skip if violation is pending or DENIED was clicked"""
         try:
+            # Check if DENIED button was clicked - if so, don't schedule auto-clear (waiting for guard decision)
+            if hasattr(self, 'denied_button_clicked') and self.denied_button_clicked:
+                print(f"⏸️ Main screen clear skipped - DENIED button clicked, waiting for guard decision")
+                return
+            
+            # Check if there's a violation pending - if so, don't schedule auto-clear
+            # Violation is pending if incomplete_student_info_for_approve is set or if there are active violations
+            has_pending_violation = (
+                hasattr(self, 'incomplete_student_info_for_approve') and 
+                self.incomplete_student_info_for_approve is not None
+            ) or (
+                hasattr(self, 'active_session_violations') and 
+                self.active_session_violations and 
+                any(len(violations) > 0 for violations in self.active_session_violations.values())
+            )
+            
+            if has_pending_violation:
+                print(f"⏸️ Main screen clear skipped - violation pending, waiting for gate control button")
+                return
+            
             # Cancel any existing timer
             if self.main_screen_clear_timer is not None:
                 try:
@@ -14719,12 +15559,32 @@ class GuardMainControl:
             # Clear the timer reference
             self.main_screen_clear_timer = None
             
+            # Check if DENIED button was clicked - if so, don't clear (waiting for guard decision)
+            if hasattr(self, 'denied_button_clicked') and self.denied_button_clicked:
+                print(f"⏸️ Main screen clear cancelled - DENIED button clicked, waiting for guard decision")
+                return
+            
             # Check if detection is still active - if so, don't clear yet
             # (Detection might still be running and we don't want to interrupt it)
             if hasattr(self, 'detection_active') and self.detection_active:
                 print(f"⏸️ Main screen clear skipped - detection still active")
                 # Reschedule for another 15 seconds
                 self._schedule_main_screen_clear()
+                return
+            
+            # Check if there's a violation pending - if so, don't clear yet
+            # Violation is pending if incomplete_student_info_for_approve is set or if there are active violations
+            has_pending_violation = (
+                hasattr(self, 'incomplete_student_info_for_approve') and 
+                self.incomplete_student_info_for_approve is not None
+            ) or (
+                hasattr(self, 'active_session_violations') and 
+                self.active_session_violations and 
+                any(len(violations) > 0 for violations in self.active_session_violations.values())
+            )
+            
+            if has_pending_violation:
+                print(f"⏸️ Main screen clear skipped - violation pending, waiting for gate control button")
                 return
             
             # Clear all widgets from person display frame
@@ -15548,11 +16408,12 @@ once camera is fully initialized"""
         # Reset uniform tracking
         self.reset_uniform_tracking()
         
-        # Hide requirements section when detection stops
-        try:
-            self.hide_requirements_section()
-        except Exception:
-            pass
+        # Keep requirements section visible - only hide when gate control button is clicked
+        # Don't hide when detection stops - requirements stay visible until guard clicks a button
+        # try:
+        #     self.hide_requirements_section()
+        # except Exception:
+        #     pass
         
         # Return main screen to standby
         if self.main_screen_window and self.main_screen_window.winfo_exists():
