@@ -1,4 +1,4 @@
-# guard_ui_2.py
+                                                                                                                                                                                                                    # guard_ui_2.py
 # Simplified and robust Guard Control Center
 
 import time
@@ -855,6 +855,7 @@ class GuardMainControl:
         self.login_tab = None
         self.dashboard_tab = None
         self.visitor_tab = None
+        self.rfid_history_tab = None
         self.student_forgot_tab = None
         self.main_screen_window = None
         
@@ -888,6 +889,12 @@ class GuardMainControl:
         self.rfid_assignment_active = False
         # Flag to track when visitor RFID assignment mode is active
         self.visitor_rfid_assignment_active = False
+        # Flag to track when RFID return mode is active
+        self.visitor_rfid_return_mode = False
+        # References to return RFID dialog
+        self.return_rfid_dialog = None
+        self.return_rfid_entry_var = None
+        self.return_rfid_entry = None
         
         # Main screen display timer (for auto-clearing after 15 seconds)
         self.main_screen_clear_timer = None
@@ -959,6 +966,10 @@ class GuardMainControl:
         self.original_uniform_status = None  # Store if student was originally complete or incomplete
         self.complete_uniform_auto_entry_timer = None  # Timer for auto-entry after complete uniform (8 seconds)
         self.complete_uniform_student_info = None  # Store student info for complete uniform auto-entry
+        
+        # Local cache to track recent entries (prevents race condition with Firebase)
+        # Maps RFID to timestamp when entry was saved
+        self.recent_entry_cache = {}  # {rfid: timestamp}
         
         # Initialize Arduino connection after UI is ready
         self.root.after(300, self.init_arduino_connection)
@@ -2122,7 +2133,7 @@ class GuardMainControl:
                             # Reset DENIED button text and command to original (but keep it enabled)
                             if hasattr(self, 'deny_button') and self.deny_button:
                                 self.deny_button.config(
-                                    text="DENIED\n(Keep Locked)",
+                                    text="DENIED",
                                     command=self.handle_interface_deny
                                 )
                             
@@ -3428,17 +3439,26 @@ class GuardMainControl:
             detection_active = getattr(self, 'detection_active', False)
             uniform_complete = getattr(self, 'uniform_detection_complete', False)
             
-            if detection_active and not uniform_complete:
-                # Detection in progress - show DETECTING
+            # CRITICAL: If status is TIME-IN or ENTRY, don't show DETECTING even if detection_active is True
+            # This happens when entry is saved but detection_active flag wasn't reset yet
+            status_from_data = str(person_data.get('status', '')).upper()
+            is_entry_status = status_from_data in ('TIME-IN', 'ENTRY', 'TIME-IN (WITH VIOLATION)', 'TIME-IN (EVENT MODE)')
+            
+            if detection_active and not uniform_complete and not is_entry_status:
+                # Detection in progress - show DETECTING (but not if entry was already saved)
                 status_text = "DETECTING"
                 status_color = '#f59e0b'  # Orange/amber
             elif person_data.get('status') == 'COMPLETE UNIFORM' or uniform_complete:
                 # Complete uniform - show ENTRY
                 status_text = "ENTRY"
                 status_color = '#10b981'  # Green
-            elif str(action).upper() == 'ENTRY':
-                # Entry but check if we should show DETECTING instead
-                if status_val == 'DETECTING':
+            elif str(action).upper() == 'ENTRY' or is_entry_status:
+                # Entry - prioritize entry status over DETECTING
+                # If status is TIME-IN, always show ENTRY, not DETECTING
+                if is_entry_status:
+                    status_text = "ENTRY"
+                    status_color = '#10b981'  # Green for entry
+                elif status_val == 'DETECTING':
                     status_text = "DETECTING"
                     status_color = '#f59e0b'  # Orange/amber
                 else:
@@ -3753,14 +3773,32 @@ class GuardMainControl:
             self.display_person_info(person_data)
             # DO NOT add to recent entries here - only log after complete uniform
             # Entry logging should only happen in record_complete_uniform_entry()
-            # Schedule clearing main screen after 15 seconds
-            self._schedule_main_screen_clear()
+            # CRITICAL: Don't schedule clear timer if entry was just saved (timer already scheduled in clear_main_screen_after_gate_action)
+            # Check if entry was recently saved by checking if detection_active is False and uniform_detection_complete is True
+            entry_was_saved = (
+                hasattr(self, 'detection_active') and not self.detection_active and
+                hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete
+            )
+            if not entry_was_saved:
+                # Schedule clearing main screen after 15 seconds (only if entry was NOT just saved)
+                self._schedule_main_screen_clear()
+            else:
+                print(f"⏸️ Skipping _schedule_main_screen_clear - entry was just saved, timer already scheduled")
     
     def update_main_screen_with_person_info(self, person_id, person_name, person_type):
         """Update main screen when person taps their ID"""
         try:
             if not self.main_screen_window or not self.main_screen_window.winfo_exists():
                 return
+            
+            # CRITICAL: Don't overwrite ENTRY status if entry was just saved
+            # Check if entry was recently saved by checking if detection_active is False and uniform_detection_complete is True
+            if person_type.lower() == 'student':
+                if hasattr(self, 'detection_active') and not self.detection_active:
+                    if hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete:
+                        # Entry was just saved - don't overwrite with DETECTING
+                        print(f"⏸️ Skipping update_main_screen_with_person_info - entry was just saved, keep ENTRY status visible")
+                        return  # Exit early - don't overwrite entry status
             
             # In Event Mode, ALLOW showing student info (but no "DETECTING" status)
             # Event Mode just bypasses detection, but we still show student info
@@ -4010,10 +4048,8 @@ class GuardMainControl:
         left_column.pack_propagate(False)
 
         # Put person entry and gate controls on the left
+        # UNIFORM REQUIREMENTS will be created inside Person ID Entry section
         self.create_person_entry_section(left_column)
-        
-        # Requirement Parts section - moved from camera feed right panel
-        self.create_requirement_parts_section(left_column)
         
         # Guard on duty display - at the bottom of left column
         guard_duty_frame = tk.Frame(left_column, bg='#ffffff')
@@ -4078,45 +4114,51 @@ class GuardMainControl:
             relief='groove',
             bd=2
         )
+        # Store entry_frame as instance variable so requirements section can pack before it
+        self.entry_frame = entry_frame
         entry_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        # Special action buttons
-        type_frame = tk.Frame(entry_frame, bg='#ffffff')
+        # Create a container frame for content that can expand (everything except Gate Control)
+        self.entry_content_frame = tk.Frame(entry_frame, bg='#ffffff')
+        self.entry_content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Special action buttons - inside content frame
+        type_frame = tk.Frame(self.entry_content_frame, bg='#ffffff')
         type_frame.pack(fill=tk.X, padx=15, pady=(15, 12))
         
         # Special buttons row
         special_buttons_frame = tk.Frame(type_frame, bg='#ffffff')
         special_buttons_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # Manual visitor entry button
+        # Manual visitor entry button - slightly bigger size
         self.manual_visitor_btn = tk.Button(
             special_buttons_frame,
             text="📝 Visitor",
             command=self.handle_manual_visitor,
-            font=('Arial', 12, 'bold'),
+            font=('Arial', 11, 'bold'),  # Slightly bigger font
             bg='#10b981',
             fg='white',
             relief='raised',
-            bd=3,
-            padx=20,
-            pady=12,
+            bd=2,
+            padx=12,  # Slightly bigger padding
+            pady=7,  # Slightly bigger padding
             cursor='hand2',
             activebackground='#059669',
             activeforeground='white'
         )
         self.manual_visitor_btn.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
         
-        # Event Mode toggle button - moved from gate control section
+        # Event Mode toggle button - resized
         self.event_mode_btn = tk.Button(
             special_buttons_frame,
             text="Event Mode:\nOFF",
-            font=('Arial', 12, 'bold'),
+            font=('Arial', 10, 'bold'),  # Resized font
             bg='#9ca3af',  # Gray when OFF
             fg='white',
             relief='raised',
-            bd=3,
-            padx=20,
-            pady=12,
+            bd=2,
+            padx=4,  # Resized padding
+            pady=2,  # Resized padding
             cursor='hand2',
             activebackground='#6b7280',
             activeforeground='white',
@@ -4124,15 +4166,15 @@ class GuardMainControl:
         )
         self.event_mode_btn.pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
         
-        # Return RFID button
-        return_rfid_frame = tk.Frame(entry_frame, bg='#ffffff')
+        # Return RFID button - inside content frame
+        return_rfid_frame = tk.Frame(self.entry_content_frame, bg='#ffffff')
         return_rfid_frame.pack(fill=tk.X, padx=15, pady=(15, 15))
         
         # Add a globally accessible Return Assigned RFID button for quick access
         self.return_assigned_rfid_btn = tk.Button(
             return_rfid_frame,
             text="RETURN RFID",
-            command=lambda: getattr(self, 'return_assigned_rfid_dialog', lambda: messagebox.showerror('Error', 'Return RFID feature not available'))(),
+            command=self.handle_rfid_history_tab,
             font=('Arial', 12, 'bold'),
             bg='#f97316',
             fg='white',
@@ -4146,9 +4188,35 @@ class GuardMainControl:
         )
         self.return_assigned_rfid_btn.pack(fill=tk.X, pady=(0, 15))
         
-        # Gate Control section - integrated into Person ID Entry
+        # UNIFORM REQUIREMENTS box - always visible container inside Person ID Entry
+        # The box stays visible, but requirement parts only appear when student ID is tapped
+        self.requirements_box_frame = tk.LabelFrame(
+            self.entry_content_frame,
+            text="UNIFORM REQUIREMENTS",
+            font=('Arial', 12, 'bold'),
+            fg='#1f2937',
+            bg='#ffffff',
+            relief='groove',
+            bd=2
+        )
+        # Pack with minimal height when empty - will expand when requirements are shown
+        # Positioned above Gate Control section
+        # Pack the box - it will be visible even when empty
+        self.requirements_box_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
+        
+        # Add a larger spacer to ensure box is visible and has good size when empty
+        # This prevents the box from collapsing to zero height and makes it more prominent
+        self.requirements_spacer = tk.Frame(self.requirements_box_frame, bg='#ffffff', height=100)
+        self.requirements_spacer.pack(fill=tk.BOTH, expand=True)
+        
+        # Create requirements section inside the box (initially hidden)
+        self.create_requirement_parts_section(self.requirements_box_frame)
+        
+        # Gate Control section - fixed at bottom of Person ID Entry (doesn't move when requirements appear)
         gate_control_frame = tk.Frame(entry_frame, bg='#ffffff')
-        gate_control_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
+        self.gate_control_frame = gate_control_frame  # Store reference
+        # Pack at bottom so it stays fixed - requirements will appear above it in entry_content_frame
+        gate_control_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=15, pady=(0, 15))
         
         # Gate Control title
         gate_title = tk.Label(
@@ -4192,16 +4260,17 @@ class GuardMainControl:
         buttons_frame.pack(fill=tk.X, pady=(0, 5))
         
         # Approve button - DISABLED by default, only enabled when incomplete uniform is detected
+        # Slightly bigger size
         self.approve_button = tk.Button(
             buttons_frame,
-            text="ACCESS GRANTED\n(Unlock Gate)",
-            font=('Arial', 9, 'bold'),
+            text="ACCESS GRANTED",
+            font=('Arial', 11, 'bold'),  # Slightly bigger font
             bg='#10b981',
             fg='white',
             relief='raised',
-            bd=2,
-            padx=5,
-            pady=6,
+            bd=2,  # Thicker border
+            padx=10,  # Slightly bigger padding
+            pady=6,  # Slightly bigger padding
             cursor='hand2',
             activebackground='#059669',
             activeforeground='white',
@@ -4214,17 +4283,18 @@ class GuardMainControl:
         self.incomplete_student_info_for_approve = None
         
         # Cancel button - DISABLED by default, only enabled after incomplete uniform or DENIED clicked
+        # Slightly bigger size
         self.cancel_button = tk.Button(
             buttons_frame,
             text="CANCEL",
-            font=('Arial', 9, 'bold'),
+            font=('Arial', 11, 'bold'),  # Slightly bigger font
             bg='#6b7280',
             fg='white',
             disabledforeground='#d1d5db',  # Light gray text when disabled - ensures text is visible
             relief='raised',
             bd=2,
-            padx=5,
-            pady=6,
+            padx=10,  # Slightly bigger padding
+            pady=6,  # Slightly bigger padding
             cursor='hand2',
             activebackground='#4b5563',
             activeforeground='white',
@@ -4233,17 +4303,17 @@ class GuardMainControl:
         )
         self.cancel_button.pack(side=tk.LEFT, padx=(2, 2), fill=tk.X, expand=True)
         
-        # Deny button
+        # Deny button - slightly bigger size
         self.deny_button = tk.Button(
             buttons_frame,
-            text="DENIED\n(Keep Locked)",
-            font=('Arial', 9, 'bold'),
+            text="DENIED",
+            font=('Arial', 11, 'bold'),  # Slightly bigger font
             bg='#dc2626',
             fg='white',
             relief='raised',
-            bd=2,
-            padx=5,
-            pady=6,
+            bd=2,  # Thicker border
+            padx=10,  # Slightly bigger padding
+            pady=6,  # Slightly bigger padding
             cursor='hand2',
             activebackground='#b91c1c',
             activeforeground='white',
@@ -4265,7 +4335,7 @@ class GuardMainControl:
         # Create hidden RFID Entry field for global RFID capture
         # This field is invisible but always ready to receive RFID input
         self.hidden_rfid_entry = tk.Entry(
-            entry_frame,
+            self.entry_content_frame,
             textvariable=self.person_id_var,
             width=1,
             font=('Arial', 1),
@@ -4284,18 +4354,14 @@ class GuardMainControl:
         self.hidden_rfid_entry.config(takefocus=True)
     
     def create_requirement_parts_section(self, parent):
-        """Create Requirement Parts section in left column"""
-        # Requirement Parts frame
-        self.requirements_frame = tk.LabelFrame(
+        """Create Requirement Parts section inside the requirements box"""
+        # Requirement Parts container (inside the box, not a separate LabelFrame)
+        self.requirements_frame = tk.Frame(
             parent,
-            text="Requirement Parts",
-            font=('Arial', 12, 'bold'),
-            fg='#1f2937',
-            bg='#ffffff',
-            relief='groove',
-            bd=2
+            bg='#ffffff'
         )
-        self.requirements_frame.pack(fill=tk.X, padx=15, pady=(10, 15))
+        # Don't pack yet - will be packed when shown
+        # Initial pack is done in show_requirements_section
         
         # Student info label - Name and Course/Senior High School
         self.requirements_student_info_label = tk.Label(
@@ -4491,6 +4557,22 @@ class GuardMainControl:
             
             # Clear the field immediately for next RFID
             self.person_id_var.set("")
+            
+            # Check if we're in RFID return mode (highest priority)
+            if hasattr(self, 'visitor_rfid_return_mode') and self.visitor_rfid_return_mode:
+                print(f"🔍 RFID return mode is ACTIVE - auto-filling RFID in return dialog: {rfid}")
+                # Auto-fill the RFID in the return dialog if it's open
+                if hasattr(self, 'return_rfid_entry_var') and self.return_rfid_entry_var:
+                    self.return_rfid_entry_var.set(rfid)
+                    # Focus the entry field
+                    if hasattr(self, 'return_rfid_entry') and self.return_rfid_entry:
+                        self.return_rfid_entry.focus_set()
+                        self.return_rfid_entry.select_range(0, tk.END)
+                    print(f"✅ RFID {rfid} auto-filled in return dialog")
+                else:
+                    # Dialog not open, process directly
+                    self.process_rfid_return(rfid)
+                return
             
             # Check if we're in visitor RFID assignment mode
             if hasattr(self, 'visitor_rfid_assignment_active') and self.visitor_rfid_assignment_active:
@@ -6255,10 +6337,10 @@ class GuardMainControl:
         )
         self.visitor_mi_entry.grid(row=1, column=2, sticky=tk.E, padx=(0, 10))
         
-        # Suffix
+        # Suffix (Optional)
         suffix_label = tk.Label(
             name_grid,
-            text="Suffix:",
+            text="Suffix: (Optional)",
             font=('Arial', 12, 'bold'),
             fg='#374151',
             bg='#ffffff'
@@ -7305,6 +7387,15 @@ class GuardMainControl:
                               f"Assigned RFID: {selected_rfid}\n\n"
                               f"The visitor can now use the RFID card for entry and exit.")
             
+            # Refresh RFID history table if it exists (tab is open)
+            try:
+                if hasattr(self, 'rfid_history_tree') and self.rfid_history_tree is not None:
+                    # Small delay to ensure Firebase write is complete
+                    self.root.after(500, self.refresh_rfid_history)
+                    print(f"✅ Scheduled RFID history refresh after visitor registration")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not refresh RFID history: {e}")
+            
             # Clear form
             self.visitor_surname_entry.delete(0, tk.END)
             self.visitor_firstname_entry.delete(0, tk.END)
@@ -7794,15 +7885,15 @@ class GuardMainControl:
                             for visitor_doc in visitors:
                                 visitor_data = visitor_doc.to_dict()
                                 status = visitor_data.get('status', '')
-                                # Only update if visitor is 'registered' or 'active' (not 'exited')
+                                # Only update if visitor is 'registered' or 'active' (not 'returned')
                                 if status == 'registered' or status == 'active':
-                                    # Clear RFID assignment and mark as exited/returned
+                                    # Mark as returned (keep RFID for history tracking)
                                     visitor_doc.reference.update({
-                                        'rfid': None,  # Clear RFID assignment
-                                        'status': 'exited',  # Mark visitor as exited/returned
-                                        'time_out': self.get_current_timestamp()  # Set time_out if not already set
+                                        'status': 'returned',  # Mark visitor as returned
+                                        'time_out': self.get_current_timestamp() if not visitor_data.get('time_out') else visitor_data.get('time_out')
+                                        # Note: We keep 'rfid' field for history tracking - RFID availability is managed separately
                                     })
-                                    print(f"✅ Updated visitor record: cleared RFID {choice} and marked as exited")
+                                    print(f"✅ Updated visitor record: cleared RFID {choice} and marked as returned")
                         except Exception as e:
                             print(f"⚠️ Warning: Could not update visitor record in Firebase: {e}")
                             import traceback
@@ -7838,6 +7929,885 @@ class GuardMainControl:
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to return assigned RFID: {e}")
+
+    def handle_rfid_history_tab(self):
+        """Handle RFID history tab - create and switch to RFID history tab"""
+        try:
+            # Create RFID history tab
+            self.create_rfid_history_tab()
+            
+            # Switch to RFID history tab
+            self.notebook.select(self.rfid_history_tab)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open RFID history: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def create_rfid_history_tab(self):
+        """Create RFID history tab"""
+        if self.rfid_history_tab is None:
+            self.rfid_history_tab = tk.Frame(self.notebook, bg='#ffffff')
+            self.notebook.add(self.rfid_history_tab, text="📋 RFID History")
+            
+            # Create RFID history content
+            self.create_rfid_history_content(self.rfid_history_tab)
+    
+    def create_rfid_history_content(self, parent):
+        """Create RFID history content in tab format"""
+        try:
+            # Main container
+            main_frame = tk.Frame(parent, bg='#ffffff')
+            main_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=30)
+            
+            # Header with back button
+            header_frame = tk.Frame(main_frame, bg='#ffffff')
+            header_frame.pack(fill=tk.X, pady=(0, 30))
+            
+            # Back button at top
+            back_btn = tk.Button(
+                header_frame,
+                text="← Back to Dashboard",
+                command=self.back_to_dashboard,
+                font=('Arial', 12, 'bold'),
+                bg='#6b7280',
+                fg='white',
+                relief='raised',
+                bd=3,
+                padx=20,
+                pady=8,
+                cursor='hand2',
+                activebackground='#4b5563',
+                activeforeground='white'
+            )
+            back_btn.pack(anchor=tk.W, pady=(0, 15))
+            
+            # Title
+            title_label = tk.Label(
+                header_frame,
+                text="📋 RFID Usage History",
+                font=('Arial', 24, 'bold'),
+                fg='#1e3a8a',
+                bg='#ffffff'
+            )
+            title_label.pack()
+            
+            subtitle_label = tk.Label(
+                header_frame,
+                text="View and manage RFID card assignments",
+                font=('Arial', 14),
+                fg='#6b7280',
+                bg='#ffffff'
+            )
+            subtitle_label.pack(pady=(5, 0))
+            
+            # Create frame for table with scrollbars
+            table_frame = tk.Frame(main_frame, bg='#ffffff')
+            table_frame.pack(fill=tk.BOTH, expand=True, pady=(20, 0))
+            
+            # Create Treeview for table
+            columns = ('Name', 'Time in', 'Time out', 'Status', 'Companion', 'ID type', 'Assigned RFID')
+            tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=20)
+            
+            # Configure column headings
+            tree.heading('Name', text='Name')
+            tree.heading('Time in', text='Time in')
+            tree.heading('Time out', text='Time out')
+            tree.heading('Status', text='Status')
+            tree.heading('Companion', text='Companion')
+            tree.heading('ID type', text='ID type')
+            tree.heading('Assigned RFID', text='Assigned RFID')
+            
+            # Configure column widths
+            tree.column('Name', width=200, anchor='w')
+            tree.column('Time in', width=100, anchor='center')
+            tree.column('Time out', width=100, anchor='center')
+            tree.column('Status', width=100, anchor='center')
+            tree.column('Companion', width=100, anchor='center')
+            tree.column('ID type', width=120, anchor='center')
+            tree.column('Assigned RFID', width=150, anchor='center')
+            
+            # Scrollbars
+            v_scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
+            h_scrollbar = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=tree.xview)
+            tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+            
+            # Grid layout
+            tree.grid(row=0, column=0, sticky='nsew')
+            v_scrollbar.grid(row=0, column=1, sticky='ns')
+            h_scrollbar.grid(row=1, column=0, sticky='ew')
+            table_frame.grid_rowconfigure(0, weight=1)
+            table_frame.grid_columnconfigure(0, weight=1)
+            
+            # Load history data from Firebase
+            history_data = []
+            
+            if self.firebase_initialized and self.db:
+                try:
+                    from datetime import datetime
+                    
+                    # Query visitors collection for active/registered visitors
+                    try:
+                        visitors_ref = self.db.collection('visitors')
+                        try:
+                            # Try to order by timestamp if it exists
+                            visitors = visitors_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(100).get()
+                        except Exception:
+                            # Fallback: get all visitors without ordering
+                            visitors = visitors_ref.limit(100).get()
+                        
+                        for visitor_doc in visitors:
+                            visitor_data = visitor_doc.to_dict()
+                            rfid = visitor_data.get('rfid', '')
+                            status_val = visitor_data.get('status', 'active')
+                            
+                            # Show entries with RFID assigned (including returned ones - we keep RFID for history)
+                            if not rfid:
+                                continue
+                            
+                            name = visitor_data.get('name', 'Unknown')
+                            time_in_str = visitor_data.get('time_in', '')
+                            time_out_str = visitor_data.get('time_out', '')
+                            companion = str(visitor_data.get('companion_count', 0) or visitor_data.get('companion', 0) or '0')
+                            
+                            # Get ID type
+                            id_type_val = visitor_data.get('id_type', '')
+                            id_type = 'Not specified'
+                            if id_type_val:
+                                id_type_map = {
+                                    'driver_license': "Driver's License",
+                                    'national_id': "National ID",
+                                    'passport': 'Passport',
+                                    'not_specified': 'Not specified'
+                                }
+                                id_type = id_type_map.get(id_type_val, id_type_val.replace('_', ' ').title())
+                            
+                            time_in = ''
+                            time_out = ''
+                            
+                            # Parse time_in if it exists
+                            if time_in_str:
+                                try:
+                                    dt = datetime.strptime(time_in_str, "%Y-%m-%d %H:%M:%S")
+                                    time_in = dt.strftime("%H:%M")
+                                except:
+                                    time_in = time_in_str[:5] if len(time_in_str) >= 5 else time_in_str
+                            
+                            # Parse time_out if it exists
+                            if time_out_str:
+                                try:
+                                    dt = datetime.strptime(time_out_str, "%Y-%m-%d %H:%M:%S")
+                                    time_out = dt.strftime("%H:%M")
+                                except:
+                                    time_out = time_out_str[:5] if len(time_out_str) >= 5 else time_out_str
+                            
+                            # Determine status: Only 2 statuses - "In-use" or "Returned"
+                            # "In-use" = registered or active (has RFID assigned, not returned)
+                            # "Returned" = RFID has been returned (status is 'returned')
+                            if status_val == 'returned':
+                                status = 'Returned'
+                            else:
+                                # Registered or active = In-use (even if time_out exists)
+                                status = 'In-use'
+                            
+                            # Add entry if it has an RFID assigned
+                            if rfid:
+                                history_data.append({
+                                    'name': name,
+                                    'time_in': time_in,
+                                    'time_out': time_out,
+                                    'status': status,
+                                    'companion': companion,
+                                    'id_type': id_type,
+                                    'rfid': rfid,
+                                    'type': 'visitor'
+                                })
+                    except Exception as e:
+                        print(f"⚠️ Warning: Could not load visitors: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    
+                except Exception as e:
+                    print(f"⚠️ Warning: Error loading RFID history: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Populate table with history data
+            for item in history_data:
+                tree.insert('', 'end', values=(
+                    item['name'],
+                    item['time_in'],
+                    item['time_out'],
+                    item['status'],
+                    item['companion'],
+                    item['id_type'],
+                    item['rfid']
+                ))
+            
+            # If no data, show message
+            if not history_data:
+                tree.insert('', 'end', values=('No RFID usage history found', '', '', '', '', '', ''))
+            
+            # Store tree reference for return function
+            self.rfid_history_tree = tree
+            
+            # Button frame
+            button_frame = tk.Frame(main_frame, bg='#ffffff')
+            button_frame.pack(fill=tk.X, pady=(15, 0))
+            
+            # Return button
+            return_btn = tk.Button(
+                button_frame,
+                text="Return",
+                command=lambda: self.return_rfid_from_history_tab(),
+                font=('Arial', 12, 'bold'),
+                bg='#f97316',
+                fg='white',
+                relief='raised',
+                bd=2,
+                padx=20,
+                pady=10,
+                cursor='hand2',
+                activebackground='#ea580c',
+                activeforeground='white'
+            )
+            return_btn.pack(side=tk.RIGHT, padx=(10, 0))
+            
+            # Refresh button
+            refresh_btn = tk.Button(
+                button_frame,
+                text="🔄 Refresh",
+                command=lambda: self.refresh_rfid_history(),
+                font=('Arial', 12),
+                bg='#3b82f6',
+                fg='white',
+                relief='raised',
+                bd=2,
+                padx=20,
+                pady=10,
+                cursor='hand2',
+                activebackground='#2563eb',
+                activeforeground='white'
+            )
+            refresh_btn.pack(side=tk.RIGHT, padx=(10, 0))
+            
+            # Load initial data
+            self.refresh_rfid_history()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create RFID history: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def refresh_rfid_history(self):
+        """Refresh the RFID history table with latest data"""
+        try:
+            if not hasattr(self, 'rfid_history_tree') or self.rfid_history_tree is None:
+                return
+            
+            tree = self.rfid_history_tree
+            
+            # Clear existing items
+            for item in tree.get_children():
+                tree.delete(item)
+            
+            # Load history data from Firebase
+            history_data = []
+            
+            if self.firebase_initialized and self.db:
+                try:
+                    from datetime import datetime
+                    
+                    # Query visitors collection for all visitors with RFID assigned
+                    try:
+                        visitors_ref = self.db.collection('visitors')
+                        # Get all visitors (no limit, we'll filter locally)
+                        all_visitors = visitors_ref.get()
+                        visitors_list = list(all_visitors)  # Convert to list once
+                        
+                        print(f"🔍 DEBUG: Found {len(visitors_list)} total visitors in Firebase")
+                        
+                        visitors_with_rfid = []
+                        
+                        for visitor_doc in visitors_list:
+                            visitor_data = visitor_doc.to_dict()
+                            if not visitor_data:
+                                continue
+                                
+                            rfid = visitor_data.get('rfid', '')
+                            # Only include visitors with RFID assigned (not None, not empty string)
+                            if rfid and str(rfid).strip() != '':
+                                visitors_with_rfid.append((visitor_doc, visitor_data))
+                                print(f"✅ Found visitor with RFID: {visitor_data.get('name', 'Unknown')} - RFID: {rfid}")
+                        
+                        print(f"🔍 DEBUG: Found {len(visitors_with_rfid)} visitors with RFID assigned")
+                        
+                        # Sort by registration_time if available (most recent first)
+                        try:
+                            visitors_with_rfid.sort(key=lambda x: (
+                                x[1].get('registration_time', '') or 
+                                x[1].get('timestamp', '') or 
+                                ''
+                            ), reverse=True)
+                        except Exception as e:
+                            print(f"⚠️ Warning: Could not sort visitors: {e}")
+                        
+                        for visitor_doc, visitor_data in visitors_with_rfid:
+                            rfid = visitor_data.get('rfid', '')
+                            if not rfid or str(rfid).strip() == '':
+                                continue
+                                
+                            name = visitor_data.get('name', 'Unknown')
+                            # Time in and time out should only be set when visitor actually taps RFID
+                            # Keep them empty if not set
+                            time_in_str = visitor_data.get('time_in', '')
+                            time_out_str = visitor_data.get('time_out', '')
+                            status_val = visitor_data.get('status', 'registered')
+                            companion = str(visitor_data.get('companion_count', 0) or visitor_data.get('companion', 0) or '0')
+                            
+                            # Get ID type
+                            id_type_val = visitor_data.get('id_type', '')
+                            id_type = 'Not specified'
+                            if id_type_val:
+                                id_type_map = {
+                                    'driver_license': "Driver's License",
+                                    'national_id': "National ID",
+                                    'passport': 'Passport',
+                                    'not_specified': 'Not specified'
+                                }
+                                id_type = id_type_map.get(id_type_val, id_type_val.replace('_', ' ').title())
+                            
+                            # Initialize time_in and time_out as empty
+                            # Display both time_in and time_out if they exist (even after exit)
+                            time_in = ''
+                            time_out = ''
+                            
+                            # Parse time_in if it exists
+                            if time_in_str:
+                                try:
+                                    dt = datetime.strptime(time_in_str, "%Y-%m-%d %H:%M:%S")
+                                    time_in = dt.strftime("%H:%M")
+                                except:
+                                    time_in = time_in_str[:5] if len(time_in_str) >= 5 else time_in_str
+                            
+                            # Parse time_out if it exists
+                            if time_out_str:
+                                try:
+                                    dt = datetime.strptime(time_out_str, "%Y-%m-%d %H:%M:%S")
+                                    time_out = dt.strftime("%H:%M")
+                                except:
+                                    time_out = time_out_str[:5] if len(time_out_str) >= 5 else time_out_str
+                            
+                            # Determine status: Only 2 statuses - "In-use" or "Returned"
+                            # "In-use" = registered or active (has RFID assigned, not returned)
+                            # "Returned" = RFID has been returned (status is 'returned' only)
+                            # Note: 'exited' status should not exist - timeout doesn't change status to 'exited'
+                            if status_val == 'returned':
+                                status = 'Returned'
+                            else:
+                                # Registered or active = In-use (even if time_out exists)
+                                status = 'In-use'
+                            
+                            # Add to history data
+                            history_data.append({
+                                'name': name,
+                                'time_in': time_in,  # Empty until visitor taps RFID
+                                'time_out': time_out,  # Empty until visitor exits
+                                'status': status,
+                                'companion': companion,
+                                'id_type': id_type,
+                                'rfid': rfid,
+                                'type': 'visitor'
+                            })
+                            
+                        print(f"✅ Added {len(history_data)} visitors to history table")
+                    except Exception as e:
+                        print(f"⚠️ Warning: Could not load visitors: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    
+                except Exception as e:
+                    print(f"⚠️ Warning: Error loading RFID history: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Populate table with history data
+            for item in history_data:
+                tree.insert('', 'end', values=(
+                    item['name'],
+                    item['time_in'],
+                    item['time_out'],
+                    item['status'],
+                    item['companion'],
+                    item['id_type'],
+                    item['rfid']
+                ))
+            
+            # If no data, show message
+            if not history_data:
+                tree.insert('', 'end', values=('No RFID usage history found', '', '', '', '', '', ''))
+                
+        except Exception as e:
+            print(f"⚠️ Error refreshing RFID history: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def return_rfid_from_history_tab(self):
+        """Return RFID by showing popup dialog for RFID tap"""
+        try:
+            # Create popup dialog for returning RFID
+            return_dialog = tk.Toplevel(self.root)
+            return_dialog.title("Return RFID")
+            return_dialog.geometry("450x200")
+            return_dialog.resizable(False, False)
+            
+            # Center the dialog
+            return_dialog.transient(self.root)
+            return_dialog.grab_set()
+            
+            # Make dialog modal
+            return_dialog.focus_set()
+            
+            # Main frame
+            main_frame = tk.Frame(return_dialog, bg='#ffffff', padx=20, pady=20)
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Instructions
+            instruction_label1 = tk.Label(
+                main_frame,
+                text="Enter RFID to return (e.g. 0095129433)",
+                font=('Arial', 10),
+                bg='#ffffff',
+                fg='#333333',
+                anchor='w'
+            )
+            instruction_label1.pack(fill=tk.X, pady=(0, 5))
+            
+            instruction_label2 = tk.Label(
+                main_frame,
+                text="Place the RFID card to return on the reader:",
+                font=('Arial', 10),
+                bg='#ffffff',
+                fg='#333333',
+                anchor='w'
+            )
+            instruction_label2.pack(fill=tk.X, pady=(0, 10))
+            
+            # RFID input field
+            rfid_entry_var = tk.StringVar()
+            
+            # Check if a row is selected in the table and pre-fill RFID
+            prefill_rfid = ""
+            if hasattr(self, 'rfid_history_tree') and self.rfid_history_tree is not None:
+                try:
+                    selected_item = self.rfid_history_tree.selection()
+                    if selected_item:
+                        item_values = self.rfid_history_tree.item(selected_item[0], 'values')
+                        if item_values and len(item_values) >= 7:
+                            prefill_rfid = item_values[6]  # Assigned RFID is the 7th column (index 6)
+                            if prefill_rfid:
+                                rfid_entry_var.set(prefill_rfid)
+                except Exception as e:
+                    print(f"⚠️ Could not get selected RFID from table: {e}")
+            
+            rfid_entry = tk.Entry(
+                main_frame,
+                textvariable=rfid_entry_var,
+                font=('Arial', 12),
+                width=30,
+                relief='solid',
+                bd=1
+            )
+            rfid_entry.pack(fill=tk.X, pady=(0, 15))
+            rfid_entry.focus_set()
+            
+            # If RFID was pre-filled, select all text for easy editing
+            if prefill_rfid:
+                rfid_entry.select_range(0, tk.END)
+            
+            # Store reference for RFID auto-fill
+            self.return_rfid_dialog = return_dialog
+            self.return_rfid_entry_var = rfid_entry_var
+            self.return_rfid_entry = rfid_entry
+            
+            # Activate RFID tap mode for return
+            self.visitor_rfid_return_mode = True
+            print("✅ RFID return mode activated - waiting for RFID tap")
+            
+            # Button frame
+            button_frame = tk.Frame(main_frame, bg='#ffffff')
+            button_frame.pack(fill=tk.X)
+            
+            # OK button
+            def handle_ok():
+                rfid = rfid_entry_var.get().strip()
+                if not rfid:
+                    messagebox.showwarning("No RFID", "Please enter or tap an RFID card to return.")
+                    return
+                
+                # Process RFID return FIRST (while mode is still True)
+                # process_rfid_return will set visitor_rfid_return_mode to False when done
+                result = self.process_rfid_return(rfid)
+                
+                # Close dialog after processing
+                return_dialog.destroy()
+                self.return_rfid_dialog = None
+                self.return_rfid_entry_var = None
+                self.return_rfid_entry = None
+            
+            # Cancel button
+            def handle_cancel():
+                return_dialog.destroy()
+                self.return_rfid_dialog = None
+                self.return_rfid_entry_var = None
+                self.return_rfid_entry = None
+                self.visitor_rfid_return_mode = False
+                print("❌ RFID return cancelled")
+            
+            ok_btn = tk.Button(
+                button_frame,
+                text="OK",
+                command=handle_ok,
+                font=('Arial', 10, 'bold'),
+                bg='#4CAF50',
+                fg='white',
+                relief='raised',
+                bd=2,
+                padx=20,
+                pady=5,
+                cursor='hand2',
+                activebackground='#45a049',
+                activeforeground='white'
+            )
+            ok_btn.pack(side=tk.RIGHT, padx=(10, 0))
+            
+            cancel_btn = tk.Button(
+                button_frame,
+                text="Cancel",
+                command=handle_cancel,
+                font=('Arial', 10),
+                bg='#f44336',
+                fg='white',
+                relief='raised',
+                bd=2,
+                padx=20,
+                pady=5,
+                cursor='hand2',
+                activebackground='#da190b',
+                activeforeground='white'
+            )
+            cancel_btn.pack(side=tk.RIGHT)
+            
+            # Handle Enter key
+            def on_enter_key(event):
+                handle_ok()
+            
+            rfid_entry.bind('<Return>', on_enter_key)
+            
+            # Handle Escape key
+            def on_escape_key(event):
+                handle_cancel()
+            
+            return_dialog.bind('<Escape>', on_escape_key)
+            
+            # Handle window close
+            return_dialog.protocol("WM_DELETE_WINDOW", handle_cancel)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open return RFID dialog: {e}")
+            import traceback
+            traceback.print_exc()
+            if hasattr(self, 'visitor_rfid_return_mode'):
+                self.visitor_rfid_return_mode = False
+    
+    def process_rfid_return(self, rfid):
+        """Process RFID return when card is tapped"""
+        try:
+            if not hasattr(self, 'visitor_rfid_return_mode') or not self.visitor_rfid_return_mode:
+                return False  # Not in return mode
+            
+            rfid = str(rfid).strip()
+            if not rfid:
+                return False
+            
+            print(f"🔍 Processing RFID return for: {rfid}")
+            
+            # Find visitor with this RFID
+            visitor_found = False
+            visitor_name = 'Unknown'
+            
+            # Check Firebase to find visitor
+            if self.firebase_initialized and self.db:
+                try:
+                    visitors_ref = self.db.collection('visitors')
+                    visitors = visitors_ref.where('rfid', '==', rfid).get()
+                    
+                    for visitor_doc in visitors:
+                        visitor_data = visitor_doc.to_dict()
+                        status = visitor_data.get('status', '')
+                        
+                        # Only return if visitor is registered or active (not already returned)
+                        if status in ('registered', 'active'):
+                            visitor_found = True
+                            visitor_name = visitor_data.get('name', 'Unknown')
+                            
+                            # Update visitor status to 'returned'
+                            # Keep RFID in record for history purposes, but mark as returned
+                            visitor_doc.reference.update({
+                                'status': 'returned',
+                                'time_out': self.get_current_timestamp() if not visitor_data.get('time_out') else visitor_data.get('time_out')
+                                # Note: We keep 'rfid' field for history tracking - RFID availability is managed separately
+                            })
+                            
+                            print(f"✅ Updated visitor record: {visitor_name} - RFID {rfid} marked as returned")
+                            break
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not query Firebase for RFID return: {e}")
+            
+            # Also check student assignments
+            student_found = False
+            if not visitor_found and self.firebase_initialized and self.db:
+                try:
+                    assignments_ref = self.db.collection('student_rfid_assignments')
+                    assignments = assignments_ref.where('rfid', '==', rfid).where('status', '==', 'active').get()
+                    
+                    for assignment_doc in assignments:
+                        assignment_data = assignment_doc.to_dict()
+                        student_found = True
+                        visitor_name = assignment_data.get('name', 'Unknown')
+                        
+                        # Update assignment status to 'returned'
+                        assignment_doc.reference.update({'status': 'returned'})
+                        print(f"✅ Updated student assignment: {visitor_name} - RFID {rfid} marked as returned")
+                        break
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not query student assignments: {e}")
+            
+            if not visitor_found and not student_found:
+                messagebox.showwarning(
+                    "RFID Not Found",
+                    f"RFID {rfid} is not currently assigned to any visitor or student.\n\n"
+                    f"Please check the RFID card and try again."
+                )
+                self.visitor_rfid_return_mode = False
+                return False
+            
+            # Process return based on type
+            if visitor_found:
+                try:
+                    # Remove from memory if exists
+                    if hasattr(self, 'visitor_rfid_assignments') and rfid in self.visitor_rfid_assignments:
+                        del self.visitor_rfid_assignments[rfid]
+                    if hasattr(self, 'visitor_rfid_registry') and rfid in self.visitor_rfid_registry:
+                        del self.visitor_rfid_registry[rfid]
+                    
+                    if rfid not in self.available_rfids:
+                        self.available_rfids.append(rfid)
+                    try:
+                        self.update_rfid_availability_in_firebase(rfid, available=True)
+                    except Exception:
+                        pass
+                    
+                    try:
+                        self.load_rfid_from_firebase()
+                        self.update_student_rfid_list()
+                    except Exception:
+                        pass
+                    
+                    self.add_activity_log(f"Temporary visitor RFID returned from history: {rfid}")
+                    messagebox.showinfo("RFID Returned", f"Visitor RFID {rfid} assigned to {visitor_name} has been returned and is now available.")
+                    
+                    # Refresh the history table
+                    self.refresh_rfid_history()
+                    
+                    # Disable return mode
+                    self.visitor_rfid_return_mode = False
+                    return True
+                    
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to return visitor RFID: {e}")
+            
+            elif student_found:
+                try:
+                    # Remove from memory if exists
+                    if hasattr(self, 'student_rfid_assignments') and rfid in self.student_rfid_assignments:
+                        del self.student_rfid_assignments[rfid]
+                    
+                    if rfid not in self.available_rfids:
+                        self.available_rfids.append(rfid)
+                    try:
+                        self.update_rfid_availability_in_firebase(rfid, available=True)
+                    except Exception:
+                        pass
+                    
+                    try:
+                        self.update_student_rfid_list()
+                        self.load_rfid_from_firebase()
+                    except Exception:
+                        pass
+                    
+                    self.add_activity_log(f"Temporary student RFID returned from history: {rfid}")
+                    messagebox.showinfo("RFID Returned", f"Student RFID {rfid} assigned to {visitor_name} has been returned and is now available.")
+                    
+                    # Refresh the history table
+                    self.refresh_rfid_history()
+                    
+                    # Disable return mode
+                    self.visitor_rfid_return_mode = False
+                    return True
+                    
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to return student RFID: {e}")
+            
+            # Disable return mode
+            self.visitor_rfid_return_mode = False
+            return False
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to process RFID return: {e}")
+            import traceback
+            traceback.print_exc()
+            if hasattr(self, 'visitor_rfid_return_mode'):
+                self.visitor_rfid_return_mode = False
+            return False
+    
+    def return_rfid_from_history(self, tree, history_window):
+        """Return RFID selected from history table"""
+        try:
+            selected_item = tree.selection()
+            if not selected_item:
+                messagebox.showwarning("No Selection", "Please select a row from the table to return RFID.")
+                return
+            
+            # Get RFID from selected row
+            item_values = tree.item(selected_item[0], 'values')
+            if not item_values or len(item_values) < 7:
+                messagebox.showerror("Error", "Invalid row data.")
+                return
+            
+            rfid = item_values[6]  # Assigned RFID is the 7th column (index 6)
+            name = item_values[0]  # Name is the 1st column
+            
+            if not rfid or rfid == '':
+                messagebox.showwarning("No RFID", "Selected row does not have an RFID assigned.")
+                return
+            
+            # Confirm return
+            confirm = messagebox.askyesno(
+                "Confirm Return",
+                f"Return RFID {rfid} assigned to {name}?\n\nThis will make the RFID available for assignment again."
+            )
+            
+            if not confirm:
+                return
+            
+            # Check if it's a visitor or student
+            is_visitor = True
+            is_student = False
+            
+            # Check Firebase to determine type
+            if self.firebase_initialized and self.db:
+                try:
+                    visitors = self.db.collection('visitors').where('rfid', '==', rfid).get()
+                    if visitors:
+                        is_visitor = True
+                        is_student = False
+                    else:
+                        student_assignments = self.db.collection('student_rfid_assignments').where('rfid', '==', rfid).get()
+                        if student_assignments:
+                            is_student = True
+                            is_visitor = False
+                except Exception:
+                    pass
+            
+            # Process return based on type
+            if is_visitor:
+                try:
+                    if hasattr(self, 'visitor_rfid_assignments') and rfid in self.visitor_rfid_assignments:
+                        del self.visitor_rfid_assignments[rfid]
+                    if hasattr(self, 'visitor_rfid_registry') and rfid in self.visitor_rfid_registry:
+                        del self.visitor_rfid_registry[rfid]
+                    
+                    if self.firebase_initialized and self.db:
+                        try:
+                            visitors_ref = self.db.collection('visitors')
+                            visitors = visitors_ref.where('rfid', '==', rfid).get()
+                            for visitor_doc in visitors:
+                                visitor_data = visitor_doc.to_dict()
+                                status = visitor_data.get('status', '')
+                                if status == 'registered' or status == 'active':
+                                    visitor_doc.reference.update({
+                                        'status': 'returned',
+                                        'time_out': self.get_current_timestamp() if not visitor_data.get('time_out') else visitor_data.get('time_out')
+                                        # Note: We keep 'rfid' field for history tracking - RFID availability is managed separately
+                                    })
+                        except Exception as e:
+                            print(f"⚠️ Warning: Could not update visitor record: {e}")
+                    
+                    if rfid not in self.available_rfids:
+                        self.available_rfids.append(rfid)
+                    try:
+                        self.update_rfid_availability_in_firebase(rfid, available=True)
+                    except Exception:
+                        pass
+                    
+                    try:
+                        self.load_rfid_from_firebase()
+                        self.update_student_rfid_list()
+                    except Exception:
+                        pass
+                    
+                    self.add_activity_log(f"Temporary visitor RFID returned from history: {rfid}")
+                    messagebox.showinfo("RFID Returned", f"Visitor RFID {rfid} has been returned and is now available.")
+                    
+                    history_window.destroy()
+                    self.show_rfid_history_dialog()
+                    
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to return visitor RFID: {e}")
+            
+            elif is_student:
+                try:
+                    if hasattr(self, 'student_rfid_assignments') and rfid in self.student_rfid_assignments:
+                        del self.student_rfid_assignments[rfid]
+                    
+                    if self.firebase_initialized and self.db:
+                        try:
+                            assignments_ref = self.db.collection('student_rfid_assignments')
+                            assignments = assignments_ref.where('rfid', '==', rfid).where('status', '==', 'active').get()
+                            for assignment_doc in assignments:
+                                assignment_doc.reference.update({'status': 'returned'})
+                        except Exception:
+                            pass
+                    
+                    if rfid not in self.available_rfids:
+                        self.available_rfids.append(rfid)
+                    try:
+                        self.update_rfid_availability_in_firebase(rfid, available=True)
+                    except Exception:
+                        pass
+                    
+                    try:
+                        self.update_student_rfid_list()
+                        self.load_rfid_from_firebase()
+                    except Exception:
+                        pass
+                    
+                    self.add_activity_log(f"Temporary student RFID returned from history: {rfid}")
+                    messagebox.showinfo("RFID Returned", f"Student RFID {rfid} has been returned and is now available.")
+                    
+                    history_window.destroy()
+                    self.show_rfid_history_dialog()
+                    
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to return student RFID: {e}")
+            else:
+                messagebox.showwarning("Not Found", f"RFID {rfid} is not a currently assigned temporary RFID.")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to return RFID: {e}")
+            import traceback
+            traceback.print_exc()
 
     def clear_rfid_document(self, rfid_id):
         """Clear the RFID document in Firestore by overwriting it with an empty dict."""
@@ -8059,6 +9029,15 @@ class GuardMainControl:
                 self.stop_detection()
                 self.add_activity_log("Detection stopped - Visitor entry (no uniform checking required)")
             
+            # Refresh RFID history table if it exists (tab is open)
+            try:
+                if hasattr(self, 'rfid_history_tree') and self.rfid_history_tree is not None:
+                    # Small delay to ensure Firebase write is complete
+                    self.root.after(500, self.refresh_rfid_history)
+                    print(f"✅ Scheduled RFID history refresh after visitor time-in")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not refresh RFID history: {e}")
+            
         except Exception as e:
             print(f"ERROR: Error handling visitor time-in: {e}")
             self.add_activity_log(f"Error processing time-in for RFID {rfid}: {e}")
@@ -8092,11 +9071,13 @@ class GuardMainControl:
             # Save to Firebase
             self.save_visitor_activity_to_firebase(rfid, 'time_out', current_time, duration=str(duration))
 
-            # Update assignment last_used/status but DO NOT unassign until expiry
+            # Update assignment last_used but DO NOT change status to 'exited'
+            # Status should remain 'active' until RFID is returned via Return RFID button
             try:
                 if hasattr(self, 'visitor_rfid_assignments') and rfid in self.visitor_rfid_assignments:
                     self.visitor_rfid_assignments[rfid]['last_used'] = current_time
-                    self.visitor_rfid_assignments[rfid]['status'] = 'exited'
+                    # Keep status as 'active' - don't change to 'exited' here
+                    # Status will only change to 'returned' when Return RFID button is clicked
             except Exception:
                 pass
             
@@ -8122,6 +9103,15 @@ class GuardMainControl:
             # Reset RFID for reuse
             self.reset_visitor_rfid(rfid)
             
+            # Refresh RFID history table if it exists (tab is open)
+            try:
+                if hasattr(self, 'rfid_history_tree') and self.rfid_history_tree is not None:
+                    # Small delay to ensure Firebase write is complete
+                    self.root.after(500, self.refresh_rfid_history)
+                    print(f"✅ Scheduled RFID history refresh after visitor time-out")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not refresh RFID history: {e}")
+            
             self.show_green_success_message("Visitor Time-Out", 
                               f"Visitor: {visitor_info['name']}\n"
                               f"Time-In: {time_in}\n"
@@ -8141,9 +9131,11 @@ class GuardMainControl:
             if rfid in self.active_visitors:
                 del self.active_visitors[rfid]
             
-            # Update visitor registry status (mark as exited locally)
+            # Update visitor registry - keep status as 'active' until RFID is returned
+            # Don't change status to 'exited' - it should remain 'active' until Return RFID is clicked
             if rfid in self.visitor_rfid_registry:
-                self.visitor_rfid_registry[rfid]['status'] = 'exited'
+                # Keep status as 'active' - status will only change to 'returned' when Return RFID button is clicked
+                pass
 
             # If this RFID was a temporary visitor assignment, keep it assigned until expiry
             if hasattr(self, 'visitor_rfid_assignments') and rfid in self.visitor_rfid_assignments:
@@ -8216,17 +9208,8 @@ class GuardMainControl:
                     }
                     if self.main_screen_window and self.main_screen_window.winfo_exists():
                         self.update_main_screen_with_person(person_info)
-                        # Refresh activity log after update to ensure entry is visible
-                        if hasattr(self, 'recent_entries_listbox') and self.recent_entries_listbox:
-                            # Force refresh by re-adding the entry (it should already be there from handle_teacher_timein)
-                            try:
-                                entry_text = f"[{person_info['timestamp']}] {person_info['name']} (TEACHER) - ENTRY"
-                                # Check if entry already exists
-                                existing_entries = list(self.recent_entries_listbox.get(0, tk.END))
-                                if entry_text not in existing_entries:
-                                    self.recent_entries_listbox.insert(0, entry_text)
-                            except Exception:
-                                pass
+                        # Note: Entry is already added by handle_teacher_timein via add_to_recent_entries
+                        # No need to manually add again to avoid duplicates
                 except Exception:
                     pass
 
@@ -8254,17 +9237,8 @@ class GuardMainControl:
                     }
                     if self.main_screen_window and self.main_screen_window.winfo_exists():
                         self.update_main_screen_with_person(person_info)
-                        # Refresh activity log after update to ensure entry is visible
-                        if hasattr(self, 'recent_entries_listbox') and self.recent_entries_listbox:
-                            # Force refresh by re-adding the entry (it should already be there from handle_teacher_timeout)
-                            try:
-                                entry_text = f"[{person_info['timestamp']}] {person_info['name']} (TEACHER) - EXIT"
-                                # Check if entry already exists
-                                existing_entries = list(self.recent_entries_listbox.get(0, tk.END))
-                                if entry_text not in existing_entries:
-                                    self.recent_entries_listbox.insert(0, entry_text)
-                            except Exception:
-                                pass
+                        # Note: Entry is already added by handle_teacher_timeout via add_to_recent_entries
+                        # No need to manually add again to avoid duplicates
                 except Exception:
                     pass
 
@@ -8419,7 +9393,14 @@ class GuardMainControl:
                         visitor_update_data['status'] = 'active'
                     elif activity_type == 'time_out':
                         visitor_update_data['time_out'] = timestamp
-                        visitor_update_data['status'] = 'exited'
+                        # Don't change status to 'exited' - keep it as 'active' until RFID is returned
+                        # Status will only change to 'returned' when Return RFID button is clicked
+                        # Preserve existing status (should be 'active' or 'registered')
+                        existing_data = visitor_doc.to_dict() if visitor_doc.exists else {}
+                        if 'status' in existing_data and existing_data['status'] in ('active', 'registered'):
+                            visitor_update_data['status'] = existing_data['status']
+                        else:
+                            visitor_update_data['status'] = 'active'
                     
                     # Set created_at only if document doesn't exist
                     if not visitor_doc.exists:
@@ -8971,6 +9952,43 @@ class GuardMainControl:
             print(f"⚠️ ERROR: Failed to check approved violation: {e}")
             return False
     
+    def check_student_has_previous_violation(self, student_id):
+        """Check if student has any previous violations in Firebase
+        Returns True if student has at least one violation record, False otherwise"""
+        try:
+            if not self.firebase_initialized or not self.db:
+                print(f"⚠️ DEBUG: Firebase not initialized - cannot check previous violations for {student_id}")
+                return False
+            
+            # Check student_violations collection for this student
+            violation_ref = self.db.collection('student_violations').document(student_id)
+            violation_doc = violation_ref.get()
+            
+            if not violation_doc.exists:
+                return False
+            
+            violation_data = violation_doc.to_dict()
+            if not violation_data:
+                return False
+            
+            # Check if violation_count exists and is greater than 0
+            violation_count = violation_data.get('violation_count', 0)
+            if violation_count > 0:
+                print(f"✅ Student {student_id} has {violation_count} previous violation(s)")
+                return True
+            
+            # Also check violation_history if it exists
+            violation_history = violation_data.get('violation_history', [])
+            if violation_history and len(violation_history) > 0:
+                print(f"✅ Student {student_id} has {len(violation_history)} violation(s) in history")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"⚠️ ERROR: Failed to check previous violations for {student_id}: {e}")
+            return False
+    
     def clear_all_approved_violations_on_startup(self):
         """Clear all approved violations on app startup - resets 24-hour timer"""
         try:
@@ -9187,6 +10205,76 @@ class GuardMainControl:
             import traceback
             traceback.print_exc()
             # On error, default to False (no entry record) so student can TIME-IN
+            return False
+    
+    def delete_most_recent_entry_record(self, rfid):
+        """Delete the most recent entry record for a student from Firebase
+        This is used when guard cancels entry after it was recorded"""
+        try:
+            if not self.firebase_initialized or not self.db:
+                print(f"⚠️ WARNING: Firebase not initialized - cannot delete entry record for RFID {rfid}")
+                return False
+            
+            from datetime import datetime
+            
+            # Query Firebase for the most recent entry record for this RFID
+            query = self.db.collection('student_activities').where('rfid', '==', rfid).where('activity_type', '==', 'time_in')
+            
+            try:
+                # Try to order by timestamp descending
+                order_desc = firestore.Query.DESCENDING
+                entry_docs = query.order_by('timestamp', direction=order_desc).limit(1).get()
+            except Exception as e:
+                # Fallback: fetch a batch and sort locally
+                print(f"WARNING: Order query failed (may need composite index): {e}")
+                try:
+                    docs = query.limit(50).get()
+                    docs_list = list(docs)
+                    if docs_list:
+                        # Sort locally by timestamp (descending)
+                        docs_list.sort(key=lambda d: d.to_dict().get('timestamp', ''), reverse=True)
+                        entry_docs = docs_list[:1]
+                    else:
+                        entry_docs = []
+                except Exception as e2:
+                    print(f"ERROR: Fallback query also failed: {e2}")
+                    entry_docs = []
+            
+            if entry_docs:
+                # Get the most recent entry document
+                most_recent_doc = entry_docs[0]
+                entry_data = most_recent_doc.to_dict()
+                entry_time_str = entry_data.get('timestamp', '')
+                
+                # Check if entry is from today (only delete today's entries)
+                if entry_time_str:
+                    try:
+                        entry_time = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M:%S")
+                        now = datetime.now()
+                        
+                        # Only delete if entry is from today
+                        if entry_time.date() == now.date():
+                            # Delete the document
+                            most_recent_doc.reference.delete()
+                            print(f"✅ Deleted most recent entry record for RFID {rfid} (timestamp: {entry_time_str})")
+                            return True
+                        else:
+                            print(f"⚠️ Most recent entry is not from today ({entry_time_str}) - not deleting")
+                            return False
+                    except ValueError as e:
+                        print(f"⚠️ WARNING: Could not parse timestamp '{entry_time_str}': {e}")
+                        return False
+                else:
+                    print(f"⚠️ WARNING: Entry record has no timestamp - not deleting")
+                    return False
+            else:
+                print(f"⚠️ WARNING: No entry records found for RFID {rfid}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ ERROR: Failed to delete entry record for RFID {rfid}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def check_teacher_has_entry_record(self, rfid):
@@ -9561,8 +10649,32 @@ class GuardMainControl:
                         print(f"⚠️ WARNING: Could not stop detection before entry check: {e}")
                     
                     # CRITICAL: Check if student has entry record FIRST (before any retry logic)
-                    # This ensures that if entry was saved via APPROVE button, it will be found and treated as EXIT
-                    has_entry_record = self.check_student_has_entry_record(rfid)
+                    # First check local cache (immediate, no Firebase delay), then check Firebase
+                    import time
+                    has_entry_record = False
+                    
+                    # Check local cache first (prevents race condition)
+                    if hasattr(self, 'recent_entry_cache') and rfid in self.recent_entry_cache:
+                        cache_timestamp = self.recent_entry_cache[rfid]
+                        # Cache is valid for 5 minutes (300 seconds)
+                        if time.time() - cache_timestamp < 300:
+                            has_entry_record = True
+                            print(f"✅ Entry record found in local cache for RFID {rfid}")
+                        else:
+                            # Cache expired, remove it
+                            del self.recent_entry_cache[rfid]
+                            print(f"⏰ Cache entry expired for RFID {rfid}, removed from cache")
+                    
+                    # If not in cache, check Firebase
+                    if not has_entry_record:
+                        has_entry_record = self.check_student_has_entry_record(rfid)
+                        # If found in Firebase, add to cache
+                        if has_entry_record:
+                            if not hasattr(self, 'recent_entry_cache'):
+                                self.recent_entry_cache = {}
+                            self.recent_entry_cache[rfid] = time.time()
+                            print(f"✅ Entry record found in Firebase for RFID {rfid}, added to cache")
+                    
                     print(f"🔍 DEBUG: Checking entry record for RFID {rfid}")
                     print(f"   Has entry record: {has_entry_record}")
                     print(f"   Event Mode: {getattr(self, 'event_mode_active', False)}")
@@ -9571,7 +10683,10 @@ class GuardMainControl:
 
                     if has_entry_record:
                         # Student is inside - this is EXIT (CRITICAL: stop any running detection first)
+                        # If entry record exists, ALWAYS treat as EXIT - don't allow detection retry
+                        # This prevents detection from starting again after entry is saved
                         print(f"🎯 Student {student_info.get('name', 'Unknown')} is inside - processing EXIT")
+                        print(f"   Entry record found - treating as EXIT (no detection retry allowed)")
                         
                         # CRITICAL: Stop any running detection before processing exit
                         try:
@@ -10102,6 +11217,14 @@ class GuardMainControl:
             # Save to Firebase (with event_mode flag)
             self.save_permanent_student_activity_to_firebase(rfid, 'time_in', current_time, student_info, event_mode=event_mode)
             
+            # CRITICAL: Add to local cache immediately to prevent race condition
+            # This ensures that if RFID is tapped again before Firebase query completes, we know entry exists
+            import time
+            if not hasattr(self, 'recent_entry_cache'):
+                self.recent_entry_cache = {}
+            self.recent_entry_cache[rfid] = time.time()
+            print(f"✅ Added RFID {rfid} to recent entry cache (timestamp: {self.recent_entry_cache[rfid]})")
+            
             # Update main screen
             if self.main_screen_window and self.main_screen_window.winfo_exists():
                 self.update_main_screen_with_permanent_student(student_info, 'time_in', current_time, rfid=rfid)
@@ -10130,8 +11253,32 @@ class GuardMainControl:
             print(f"🔍 DEBUG handle_permanent_student_timein: event_mode_active = {getattr(self, 'event_mode_active', False)}")
             
             # CRITICAL: Check entry record FIRST (before any other logic)
-            # If entry record exists, this should be EXIT, not time-in
-            has_entry_record = self.check_student_has_entry_record(rfid)
+            # First check local cache (immediate, no Firebase delay), then check Firebase
+            import time
+            has_entry_record = False
+            
+            # Check local cache first (prevents race condition)
+            if hasattr(self, 'recent_entry_cache') and rfid in self.recent_entry_cache:
+                cache_timestamp = self.recent_entry_cache[rfid]
+                # Cache is valid for 5 minutes (300 seconds)
+                if time.time() - cache_timestamp < 300:
+                    has_entry_record = True
+                    print(f"✅ Entry record found in local cache for RFID {rfid} (handle_permanent_student_timein)")
+                else:
+                    # Cache expired, remove it
+                    del self.recent_entry_cache[rfid]
+                    print(f"⏰ Cache entry expired for RFID {rfid}, removed from cache")
+            
+            # If not in cache, check Firebase
+            if not has_entry_record:
+                has_entry_record = self.check_student_has_entry_record(rfid)
+                # If found in Firebase, add to cache
+                if has_entry_record:
+                    if not hasattr(self, 'recent_entry_cache'):
+                        self.recent_entry_cache = {}
+                    self.recent_entry_cache[rfid] = time.time()
+                    print(f"✅ Entry record found in Firebase for RFID {rfid}, added to cache (handle_permanent_student_timein)")
+            
             if has_entry_record:
                 print(f"🛑 CRITICAL: Entry record found in handle_permanent_student_timein - this should be EXIT!")
                 print(f"   Processing EXIT instead of starting detection")
@@ -10181,7 +11328,38 @@ class GuardMainControl:
                 
                 # Ensure detection_active is False
                 self.detection_active = False
-                self.uniform_detection_complete = False
+                # Set uniform_detection_complete to True since entry will be saved (no detection needed)
+                self.uniform_detection_complete = True
+                
+                # CRITICAL: Enable only DENIED button when approved violation is detected (re-entry scenario)
+                # Disable ACCESS GRANTED and CANCEL buttons - student already has violation, only DENIED should be enabled
+                # This allows guard to stop the student if needed during re-entry
+                if hasattr(self, 'approve_button') and self.approve_button:
+                    try:
+                        self.approve_button.config(state=tk.DISABLED)  # Disable ACCESS GRANTED button
+                        print(f"❌ ACCESS GRANTED button disabled - approved violation detected (re-entry scenario)")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not disable ACCESS GRANTED button: {e}")
+                
+                if hasattr(self, 'cancel_button') and self.cancel_button:
+                    try:
+                        self.cancel_button.config(state=tk.DISABLED)  # Disable CANCEL button
+                        print(f"❌ CANCEL button disabled - approved violation detected (re-entry scenario)")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not disable CANCEL button: {e}")
+                
+                if hasattr(self, 'deny_button') and self.deny_button:
+                    try:
+                        self.deny_button.config(state=tk.NORMAL)  # Enable DENIED button
+                        print(f"✅ DENIED button enabled - approved violation detected (re-entry scenario)")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+                
+                # CRITICAL: Store student info for approved violation re-entry scenario
+                # This will be used when DENIED is clicked to show HOLD status and enable ACCESS GRANTED
+                self.approved_violation_student_info = student_info.copy() if student_info else None
+                self.approved_violation_rfid = rfid
+                print(f"✅ Stored student info for approved violation re-entry scenario: {student_info.get('name', 'Unknown') if student_info else 'Unknown'}")
                 
                 # Hide requirements section (no detection = no requirements needed)
                 try:
@@ -10259,6 +11437,27 @@ class GuardMainControl:
                     traceback.print_exc()
                 
                 print(f"✅ Approved violation entry complete - detection bypassed successfully")
+                
+                # CRITICAL: Schedule timer to disable DENIED button after at least 10 seconds
+                # Keep DENIED enabled for at least 10 seconds to allow guard to stop student if needed
+                # Schedule a separate timer to disable DENIED button (minimum 10 seconds)
+                def disable_denied_after_delay():
+                    if hasattr(self, 'deny_button') and self.deny_button:
+                        try:
+                            self.deny_button.config(state=tk.DISABLED)
+                            print(f"✅ DENIED button disabled after 10 seconds (approved violation re-entry)")
+                        except Exception as e:
+                            print(f"⚠️ WARNING: Could not disable DENIED button: {e}")
+                
+                # Schedule DENIED button disable after 10 seconds (10000 milliseconds)
+                self.root.after(10000, disable_denied_after_delay)
+                print(f"✅ Scheduled DENIED button disable after 10 seconds (approved violation re-entry)")
+                
+                # CRITICAL: Schedule 15-second timer to clear main screen and return to standby
+                # This ensures the entry status is displayed for 15 seconds, then main screen clears
+                # Note: DENIED button will be disabled after 10 seconds (above), before main screen clears
+                self.clear_main_screen_after_gate_action()
+                
                 return  # Exit early - no detection needed
             
             # Check if Event Mode is active - bypass detection and auto-record entry
@@ -10788,7 +11987,7 @@ class GuardMainControl:
             # Reset DENIED button text and command to original (but keep it enabled)
             if hasattr(self, 'deny_button') and self.deny_button:
                 self.deny_button.config(
-                    text="DENIED\n(Keep Locked)",
+                    text="DENIED",
                     command=self.handle_interface_deny
                 )
             
@@ -11029,6 +12228,12 @@ class GuardMainControl:
             
             # Save to Firebase (with event_mode flag)
             self.save_permanent_student_activity_to_firebase(rfid, 'time_out', current_time, student_info, event_mode=event_mode)
+            
+            # CRITICAL: Clear entry from local cache when student exits
+            # This allows student to enter again later
+            if hasattr(self, 'recent_entry_cache') and rfid in self.recent_entry_cache:
+                del self.recent_entry_cache[rfid]
+                print(f"✅ Removed RFID {rfid} from recent entry cache (student exited)")
             
             # Update main screen - pass RFID explicitly to ensure Student Number can be fetched
             if self.main_screen_window and self.main_screen_window.winfo_exists():
@@ -11416,7 +12621,7 @@ class GuardMainControl:
                         student_info = self.get_student_info_by_rfid(current_rfid)
                     
                     if student_info:
-                        student_id = student_info.get('student_id')
+                        student_id = student_info.get('student_id') or student_info.get('student_number')
                         if student_id:
                             current_time = self.get_current_timestamp()
                             
@@ -11444,9 +12649,18 @@ class GuardMainControl:
                                 )
                                 print(f"✅ SUCCESS: Entry saved to Firebase for {student_info.get('name', 'Unknown')}")
                                 
-                                # CRITICAL: Force delay and retry logic to ensure Firebase write is committed
+                                # CRITICAL: Add to local cache IMMEDIATELY after saving (before verification)
+                                # Entry was saved, so we should cache it right away to ensure next tap is recognized as EXIT
+                                # This prevents race condition where Firebase query might be slow
                                 import time
+                                if not hasattr(self, 'recent_entry_cache'):
+                                    self.recent_entry_cache = {}
+                                self.recent_entry_cache[current_rfid] = time.time()
+                                print(f"✅ Added RFID {current_rfid} to recent entry cache immediately after save")
+                                print(f"   - Cache timestamp: {self.recent_entry_cache[current_rfid]}")
+                                print(f"   - Next tap will be recognized as EXIT")
                                 
+                                # CRITICAL: Force delay and retry logic to ensure Firebase write is committed
                                 # Try up to 3 times to verify entry was saved (with increasing delays)
                                 verify_entry = False
                                 for attempt in range(3):
@@ -11454,13 +12668,14 @@ class GuardMainControl:
                                     time.sleep(delay)
                                     verify_entry = self.check_student_has_entry_record(current_rfid)
                                     if verify_entry:
-                                        print(f"✅ VERIFIED: Entry record confirmed in Firebase (attempt {attempt + 1}) - next tap will be EXIT")
+                                        print(f"✅ VERIFIED: Entry record confirmed in Firebase (attempt {attempt + 1})")
                                         break
                                     else:
                                         print(f"⚠️ Attempt {attempt + 1}: Entry record not yet found, retrying...")
                                 
                                 if not verify_entry:
                                     print(f"⚠️ WARNING: Entry record not found after 3 attempts - may need more time or check manually")
+                                    print(f"   - Cache is still active, so next tap will be recognized as EXIT")
                                 else:
                                     print(f"✅ SUCCESS: Entry verified in Firebase - safe to proceed")
                             except Exception as e:
@@ -11468,7 +12683,35 @@ class GuardMainControl:
                                 import traceback
                                 traceback.print_exc()
                             
-                            # Update main screen with student entry info
+                            # CRITICAL: Reset detection flags BEFORE updating main screen
+                            # This ensures main screen shows ENTRY status, not DETECTING
+                            try:
+                                # Reset detection flags FIRST (before main screen update)
+                                self.detection_active = False
+                                self.uniform_detection_complete = True  # Mark as complete since approved
+                                print(f"✅ Detection flags reset BEFORE main screen update: detection_active=False, uniform_detection_complete=True")
+                                
+                                # Clear detection session tracking
+                                if current_rfid in self.active_detection_sessions:
+                                    del self.active_detection_sessions[current_rfid]
+                                    print(f"✅ Cleared detection session for RFID {current_rfid}")
+                                
+                                # Stop any running detection
+                                if hasattr(self, 'detection_system') and self.detection_system:
+                                    self.detection_system.stop_detection()
+                                    print(f"✅ Stopped detection system after approval")
+                                
+                                # Hide requirements section
+                                try:
+                                    self.hide_requirements_section()
+                                except Exception:
+                                    pass
+                                
+                                print(f"✅ Detection session cleared - next tap will be recognized as EXIT")
+                            except Exception as e:
+                                print(f"⚠️ WARNING: Could not clear detection session: {e}")
+                            
+                            # Update main screen with student entry info (AFTER flags are reset)
                             try:
                                 if self.main_screen_window and self.main_screen_window.winfo_exists():
                                     self.update_main_screen_with_permanent_student(
@@ -11477,7 +12720,7 @@ class GuardMainControl:
                                         current_time, 
                                         rfid=current_rfid
                                     )
-                                    print(f"✅ SUCCESS: Main screen updated with student entry info")
+                                    print(f"✅ SUCCESS: Main screen updated with student entry info (detection flags already reset)")
                             except Exception as e:
                                 print(f"❌ ERROR: Failed to update main screen: {e}")
                                 import traceback
@@ -11509,32 +12752,6 @@ class GuardMainControl:
                             self.add_activity_log(f"Student Entry (With Violation): {student_info.get('name', 'Unknown')} - {current_time}")
                             print(f"INFO: Student entering with violation - entry recorded and saved to Firebase")
                             
-                            # CRITICAL: Clear detection session and stop detection to prevent restart on next tap
-                            try:
-                                # Clear detection session tracking
-                                if current_rfid in self.active_detection_sessions:
-                                    del self.active_detection_sessions[current_rfid]
-                                    print(f"✅ Cleared detection session for RFID {current_rfid}")
-                                
-                                # Stop any running detection
-                                if hasattr(self, 'detection_system') and self.detection_system:
-                                    self.detection_system.stop_detection()
-                                    print(f"✅ Stopped detection system after approval")
-                                
-                                # Reset detection flags
-                                self.detection_active = False
-                                self.uniform_detection_complete = True  # Mark as complete since approved
-                                
-                                # Hide requirements section
-                                try:
-                                    self.hide_requirements_section()
-                                except Exception:
-                                    pass
-                                
-                                print(f"✅ Detection session cleared - next tap will be recognized as EXIT")
-                            except Exception as e:
-                                print(f"⚠️ WARNING: Could not clear detection session: {e}")
-                            
                             # CRITICAL: Disable buttons after processing
                             if hasattr(self, 'approve_button'):
                                 self.approve_button.config(state=tk.DISABLED)
@@ -11549,28 +12766,41 @@ class GuardMainControl:
                             # Clear stored incomplete student info
                             self.incomplete_student_info_for_approve = None
                             print(f"✅ Cleared incomplete student info for APPROVE")
+                            
+                            # Open gate and show success (entry already saved above)
+                            self.open_gate()
+                            
+                            # Update main screen (already updated above, but ensure gate status is shown)
+                            if self.main_screen_window and self.main_screen_window.winfo_exists():
+                                # Don't overwrite entry status - it's already set by update_main_screen_with_permanent_student
+                                pass
+                            
+                            # Show success message
+                            self.show_green_success_message("Entry Approved (With Violation)", 
+                                              "SUCCESS: Entry recorded with violation\n"
+                                              "🚪 Gate is opening\n"
+                                              "👤 Student may proceed\n"
+                                              "⚠️ Violation recorded")
+                            
+                            # Return True to indicate success
+                            return True
+                        else:
+                            print(f"⚠️ WARNING: Student info missing student_id - cannot save entry")
+                            return False
+                    else:
+                        print(f"⚠️ WARNING: Student info is None - cannot save entry")
+                        return False
             else:
                 # No pending violations - APPROVE button shouldn't be enabled for this case
                 # But if somehow clicked, log warning and don't process
                 print(f"⚠️ WARNING: APPROVE button clicked but no pending violations found")
+                print(f"   Current RFID: {current_rfid}")
+                print(f"   active_session_violations keys: {list(getattr(self, 'active_session_violations', {}).keys())}")
+                if current_rfid:
+                    print(f"   Violations for {current_rfid}: {len(getattr(self, 'active_session_violations', {}).get(current_rfid, []))}")
                 print(f"   This should not happen - APPROVE button should be disabled when no incomplete uniform")
                 # Don't process - just log and return
                 return False
-            
-            # Open gate
-            self.open_gate()
-            
-            # Update main screen
-            if self.main_screen_window and self.main_screen_window.winfo_exists():
-                self.update_main_screen_with_gate_status("OPEN", "APPROVED")
-            
-            # Show success message
-            self.show_green_success_message("Gate Approved", 
-                              "SUCCESS: Entry approved\n"
-                              "🚪 Gate is opening\n"
-                              "👤 Person may proceed")
-            
-            return True
             
         except Exception as e:
             print(f"ERROR: Error handling approve button: {e}")
@@ -11775,76 +13005,22 @@ class GuardMainControl:
                                 current_time = self.get_current_timestamp()
                                 
                                 # Extract missing items from violations list if available
+                                # CRITICAL: Only use violations list for missing_items - this contains actual missing items
+                                # Do NOT use tracker's get_missing_components() or checkboxes as they may list all
+                                # unconfirmed required items, not just actual missing items
                                 missing_items = violations if violations and len(violations) > 0 else []
                                 
-                                # If violations list is empty, get missing items from requirements tracking system
-                                if not missing_items or len(missing_items) == 0:
-                                    try:
-                                        # Get correct requirements for THIS student based on their course/gender
-                                        course = student_info.get('course', '')
-                                        gender = student_info.get('gender', '')
-                                        
-                                        # Determine which preset to use for this student
-                                        course_upper = (course or "").upper()
-                                        gender_lower = (gender or "").lower()
-                                        
-                                        if "SHS" in course_upper or "SENIOR HIGH" in course_upper:
-                                            uniform_key = 'SHS'
-                                        elif "BSHM" in course_upper or "HOSPITALITY" in course_upper:
-                                            if gender_lower.startswith('f'):
-                                                uniform_key = 'BSHM_FEMALE'
-                                            else:
-                                                uniform_key = 'BSHM_MALE'
-                                        elif "BSCPE" in course_upper:
-                                            # BSCPE requirements
-                                            if gender_lower.startswith('f'):
-                                                uniform_key = 'BSCPE_MALE'  # BSCPE_FEMALE not defined yet
-                                            else:
-                                                uniform_key = 'BSCPE_MALE'
-                                        elif "ARTS" in course_upper and "SCIENCE" in course_upper:
-                                            # Arts and Science requirements
-                                            uniform_key = 'ARTS_AND_SCIENCE'
-                                        elif "TOURISM" in course_upper:
-                                            uniform_key = 'TOURISM'
-                                        else:
-                                            uniform_key = 'SHS'  # Default
-                                        
-                                        # Get requirements for this student
-                                        required = list(self.uniform_requirements_presets.get(uniform_key, []))
-                                        permanently_checked = getattr(self, '_permanently_checked_requirements', set())
-                                        
-                                        # Debug: Show current state
-                                        print(f"🔍 DEBUG: Calculating missing items for {uniform_key}")
-                                        print(f"   - Required items: {required}")
-                                        print(f"   - Permanently checked (raw): {permanently_checked}")
-                                        print(f"   - Detection counts: {getattr(self, '_requirement_detection_counts', {})}")
-                                        
-                                        # Calculate missing items (requirements not permanently checked)
-                                        # Normalize both sides for comparison - permanently_checked stores lowercase, required has original case
-                                        required_lower = [r.lower() for r in required]
-                                        permanently_checked_lower = [p.lower() for p in permanently_checked]
-                                        
-                                        # Only include items that are NOT detected (not in permanently_checked)
-                                        # CRITICAL: Items that ARE detected (checked) should NOT be in missing_items
-                                        missing_items = []
-                                        for req, req_lower in zip(required, required_lower):
-                                            if req_lower not in permanently_checked_lower:
-                                                missing_items.append(req)
-                                            else:
-                                                print(f"✅ Item '{req}' is detected (checked) - EXCLUDED from missing items")
-                                        
-                                        print(f"✅ Retrieved missing items from requirements tracking for {uniform_key}: {missing_items}")
-                                        print(f"   - Student course: {course}, gender: {gender}")
-                                        print(f"   - Required: {required}")
-                                        print(f"   - Permanently checked: {list(permanently_checked)}")
-                                        print(f"   - Required (lowercase): {required_lower}")
-                                        print(f"   - Permanently checked (lowercase): {permanently_checked_lower}")
-                                        print(f"   - Missing items (NOT detected, will be saved to Firebase): {missing_items}")
-                                    except Exception as e:
-                                        print(f"⚠️ Warning: Could not get missing items from requirements tracking: {e}")
-                                        import traceback
-                                        traceback.print_exc()
-                                        missing_items = []
+                                # Note: We do NOT fall back to checkboxes or tracker here because:
+                                # 1. Checkboxes may be auto-populated from tracker state (showing all unconfirmed items)
+                                # 2. Tracker's get_missing_components() lists all unconfirmed required parts
+                                # 3. Only the violations list from detection_result contains actual missing items
+                                
+                                if missing_items:
+                                    print(f"✅ Using violations list for missing_items: {missing_items}")
+                                    print(f"   - Only actual missing items will be stored in violation history")
+                                else:
+                                    print(f"⚠️ No violations list available - missing_items will be empty")
+                                    print(f"   - This is correct: we only store actual missing items, not all unconfirmed items")
                                 
                                 # Check if no violations detected at all (empty detection)
                                 if not violations or len(violations) == 0:
@@ -12178,17 +13354,27 @@ class GuardMainControl:
                         'status': 'pending' if not is_final else 'finalized',
                         'rfid': rfid or 'unknown'
                     }
-                    # Add missing_items if provided (for uniform violations)
+                    # Always add missing_items field (even if empty) for uniform violations
+                    # This ensures the field exists and can be updated later during finalization
                     if missing_items and isinstance(missing_items, list) and len(missing_items) > 0:
                         history_entry['missing_items'] = missing_items
                         print(f"✅ Storing missing items in violation history: {missing_items}")
                         print(f"   - Document ID: {doc_id}")
                         print(f"   - Violation type: {violation_type}")
+                    elif violation_type == 'uniform_violation':
+                        # For uniform violations, always include missing_items field (even if empty)
+                        # It will be updated during finalization with correct checkbox state
+                        history_entry['missing_items'] = []
+                        print(f"⚠️ No missing_items provided for uniform violation - setting to empty list")
+                        print(f"   - Will be updated during finalization with checkbox state")
+                        print(f"   - Document ID: {doc_id}")
                     else:
                         print(f"⚠️ WARNING: No missing_items provided or empty list for violation history")
                         print(f"   - missing_items value: {missing_items}")
                         print(f"   - Document ID: {doc_id}")
-                    details_ref.set(history_entry)
+                    # Use set with merge=True to ensure fields can be updated later
+                    details_ref.set(history_entry, merge=True)
+                    print(f"✅ Saved violation history document: {doc_id}")
                 
                 # If pending (not final), store in session tracking but don't increment count yet
                 if not is_final:
@@ -12326,21 +13512,47 @@ class GuardMainControl:
                         violation_type = latest_violation.get('violation_type')
                         timestamp = latest_violation.get('timestamp')
                         
-                        # Extract missing_items from latest violation (or combine from all if needed)
-                        missing_items = latest_violation.get('missing_items', [])
-                        print(f"🔍 DEBUG: Extracting missing_items from latest violation: {missing_items}")
-                        print(f"🔍 DEBUG: Latest violation keys: {list(latest_violation.keys())}")
+                        # CRITICAL: Get missing_items from current checkbox state (most accurate - guard's current review)
+                        # Only fall back to stored violation data if checkboxes aren't available
+                        missing_items = []
                         
-                        # If no missing_items in latest, try to get from any violation
+                        # First, try to get from current requirement checkboxes (guard's manual review)
+                        if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
+                            checked_count = 0
+                            for req_name, checkbox_data in self.requirement_checkboxes.items():
+                                if isinstance(checkbox_data, dict) and 'var' in checkbox_data:
+                                    var = checkbox_data['var']
+                                    if isinstance(var, tk.BooleanVar):
+                                        if var.get():  # Checked = present
+                                            checked_count += 1
+                            
+                            # Only use checkboxes if guard has manually reviewed (checked at least one)
+                            if checked_count > 0:
+                                for req_name, checkbox_data in self.requirement_checkboxes.items():
+                                    if isinstance(checkbox_data, dict) and 'var' in checkbox_data:
+                                        var = checkbox_data['var']
+                                        if isinstance(var, tk.BooleanVar):
+                                            if not var.get():  # Unchecked = missing
+                                                part_name = checkbox_data.get('part', req_name)
+                                                missing_items.append(part_name)
+                                if missing_items:
+                                    print(f"✅ Using current checkbox state for missing_items: {missing_items}")
+                        
+                        # Fallback: If no checkbox data, use stored violation data
                         if not missing_items or len(missing_items) == 0:
-                            print(f"🔍 DEBUG: No missing_items in latest violation, searching all pending violations...")
-                            for i, violation in enumerate(pending_violations):
-                                violation_missing = violation.get('missing_items')
-                                print(f"🔍 DEBUG: Violation {i} missing_items: {violation_missing}")
-                                if violation_missing:
-                                    missing_items = violation_missing
-                                    print(f"✅ Found missing_items in violation {i}: {missing_items}")
-                                    break
+                            missing_items = latest_violation.get('missing_items', [])
+                            print(f"🔍 DEBUG: Using stored missing_items from latest violation: {missing_items}")
+                            
+                            # If still empty, try to get from any violation
+                            if not missing_items or len(missing_items) == 0:
+                                print(f"🔍 DEBUG: No missing_items in latest violation, searching all pending violations...")
+                                for i, violation in enumerate(pending_violations):
+                                    violation_missing = violation.get('missing_items')
+                                    print(f"🔍 DEBUG: Violation {i} missing_items: {violation_missing}")
+                                    if violation_missing:
+                                        missing_items = violation_missing
+                                        print(f"✅ Found missing_items in violation {i}: {missing_items}")
+                                        break
                         
                         print(f"🔍 DEBUG: Final missing_items to save: {missing_items}")
                         print(f"🔍 DEBUG: missing_items type: {type(missing_items)}, length: {len(missing_items) if isinstance(missing_items, list) else 'N/A'}")
@@ -12441,15 +13653,87 @@ class GuardMainControl:
                         except Exception as e:
                             print(f"⚠️ Warning: Could not verify saved document: {e}")
                         
-                        # Update all violation history entries to "finalized" status
+                        # Update all violation history entries to "finalized" status and update missing_items
                         for violation in pending_violations:
-                            # Update history entry status to finalized
+                            # Update history entry status to finalized and missing_items (use current checkbox state)
                             violation_timestamp = violation.get('timestamp')
-                            # Query for the history entry with matching timestamp
+                            
+                            # Use document ID directly (more reliable than timestamp query)
+                            # Document ID format: {student_id}_{formatted_timestamp}
+                            formatted_timestamp = self.format_document_id(violation_timestamp)
+                            doc_id = f"{student_id}_{formatted_timestamp}"
                             history_ref = violation_ref.collection('violation_history')
-                            history_docs = history_ref.where('timestamp', '==', violation_timestamp).limit(1).get()
-                            for history_doc in history_docs:
-                                history_doc.reference.update({'status': 'finalized'})
+                            history_doc_ref = history_ref.document(doc_id)
+                            
+                            # Always update status to finalized and missing_items
+                            update_data = {'status': 'finalized'}
+                            
+                            # CRITICAL: Always update missing_items with the accurate value from checkbox state
+                            # Even if it was empty initially, we should update it now with the correct value
+                            if missing_items and isinstance(missing_items, list) and len(missing_items) > 0:
+                                update_data['missing_items'] = missing_items
+                                print(f"✅ Updating violation history missing_items: {missing_items}")
+                                print(f"   - Document ID: {doc_id}")
+                                print(f"   - Timestamp: {violation_timestamp}")
+                            else:
+                                # Even if empty, set it to empty list to ensure field exists
+                                update_data['missing_items'] = []
+                                print(f"⚠️ No missing_items to update - setting to empty list")
+                                print(f"   - Document ID: {doc_id}")
+                                print(f"   - Timestamp: {violation_timestamp}")
+                            
+                            try:
+                                # Check if document exists first
+                                existing_doc = history_doc_ref.get()
+                                if not existing_doc.exists:
+                                    print(f"⚠️ WARNING: Violation history document {doc_id} does not exist!")
+                                    print(f"   - Creating it now with missing_items: {missing_items}")
+                                    # Create the document with all necessary fields
+                                    create_data = {
+                                        'violation_type': violation.get('violation_type', 'uniform_violation'),
+                                        'timestamp': violation_timestamp,
+                                        'details': violation.get('details', 'Uniform violation'),
+                                        'student_id': student_id,
+                                        'status': 'finalized',
+                                        'rfid': violation.get('rfid', 'unknown'),
+                                        'missing_items': missing_items if missing_items else []
+                                    }
+                                    history_doc_ref.set(create_data)
+                                    print(f"✅ Created violation history document: {doc_id}")
+                                else:
+                                    # Document exists, update it with merge=True
+                                    history_doc_ref.set(update_data, merge=True)
+                                    print(f"✅ Updated violation history document: {doc_id}")
+                                    print(f"   - Update data: {update_data}")
+                                
+                                # Verify the update worked
+                                verify_doc = history_doc_ref.get()
+                                if verify_doc.exists:
+                                    verify_data = verify_doc.to_dict()
+                                    if 'missing_items' in verify_data:
+                                        print(f"✅ VERIFIED: missing_items in violation history: {verify_data.get('missing_items')}")
+                                    else:
+                                        print(f"⚠️ WARNING: missing_items NOT found after update!")
+                                        print(f"   - Document keys: {list(verify_data.keys())}")
+                                else:
+                                    print(f"⚠️ WARNING: Document does not exist after update!")
+                            except Exception as e:
+                                print(f"⚠️ Warning: Could not update violation history document {doc_id}: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                # Fallback: Try querying by timestamp
+                                try:
+                                    history_docs = history_ref.where('timestamp', '==', violation_timestamp).limit(1).get()
+                                    if history_docs:
+                                        for history_doc in history_docs:
+                                            history_doc.reference.set(update_data, merge=True)
+                                            print(f"✅ Updated violation history document (fallback): {history_doc.id}")
+                                    else:
+                                        print(f"⚠️ WARNING: No violation history document found with timestamp: {violation_timestamp}")
+                                except Exception as e2:
+                                    print(f"❌ ERROR: Could not update violation history document: {e2}")
+                                    import traceback
+                                    traceback.print_exc()
                         
                         print(f"SUCCESS: Session violations finalized - count incremented to {violation_count} for {len(pending_violations)} violations")
                     
@@ -12838,7 +14122,9 @@ class GuardMainControl:
                 else:
                     title = "UNIFORM REQUIREMENTS"
                 
-                self.requirements_frame.config(text=title)
+                # Update the box frame title (not requirements_frame which is now just a container)
+                if hasattr(self, 'requirements_box_frame') and self.requirements_box_frame:
+                    self.requirements_box_frame.config(text=title)
         except Exception:
             pass
     
@@ -12865,13 +14151,21 @@ class GuardMainControl:
                 if student_info:
                     self.update_requirements_student_info(student_info)
                 
+                # Hide the spacer when showing requirements
+                if hasattr(self, 'requirements_spacer') and self.requirements_spacer:
+                    try:
+                        self.requirements_spacer.pack_forget()
+                    except:
+                        pass
+                
                 # Check if already visible, if not then pack it
                 try:
                     self.requirements_frame.pack_info()
                     # Already visible, no need to pack again
                 except tk.TclError:
-                    # Not visible, pack it
-                    self.requirements_frame.pack(fill=tk.X, padx=15, pady=(10, 15), before=None)
+                    # Not visible, pack it INSIDE requirements_box_frame
+                    # The box is always visible, we just show the contents when student ID is tapped
+                    self.requirements_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(10, 15))
         except Exception:
             pass
     
@@ -12883,15 +14177,33 @@ class GuardMainControl:
                 # Reset the scheduled flag when actually hiding
                 self.requirements_hide_scheduled = False
             
+            # Show spacer again when requirements are hidden (to keep box visible)
+            if hasattr(self, 'requirements_spacer') and self.requirements_spacer:
+                try:
+                    self.requirements_spacer.pack(fill=tk.X)
+                except:
+                    pass
+            
             # Clear student info label when hiding
             if hasattr(self, 'requirements_student_info_label') and self.requirements_student_info_label:
                 self.requirements_student_info_label.config(text="")
             
-            # Also return main screen to standby when requirements section is hidden
-            # (This happens after the 5-second delay for showing status)
-            if self.main_screen_window and self.main_screen_window.winfo_exists():
-                self.show_standby_message()
-                print(f"✅ Main screen returned to standby")
+            # CRITICAL: Don't clear main screen if entry was just saved
+            # Only clear if we're not in the middle of processing an entry
+            # Check if entry was recently saved by checking if detection_active is False and uniform_detection_complete is True
+            should_clear = True
+            if hasattr(self, 'detection_active') and not self.detection_active:
+                if hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete:
+                    # Entry was just processed - don't clear main screen yet
+                    should_clear = False
+                    print(f"⏸️ Skipping main screen clear - entry was just saved, keep entry status visible")
+            
+            if should_clear:
+                # Also return main screen to standby when requirements section is hidden
+                # (This happens after the 5-second delay for showing status)
+                if self.main_screen_window and self.main_screen_window.winfo_exists():
+                    self.show_standby_message()
+                    print(f"✅ Main screen returned to standby")
         except Exception:
             pass
 
@@ -12972,6 +14284,38 @@ class GuardMainControl:
         Handles special cases like BSHM female (rtw pants OR rtw skirt).
         """
         try:
+            # If uniform detection is complete, preserve permanently checked requirements
+            # and don't update based on current detections (to prevent reverting checkboxes)
+            if getattr(self, 'uniform_detection_complete', False):
+                # Uniform is complete - preserve permanently checked requirements
+                if not hasattr(self, '_permanently_checked_requirements'):
+                    self._permanently_checked_requirements = set()
+                
+                # Update checkboxes based on permanently checked requirements only
+                if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
+                    required = [p.lower() for p in self.current_uniform_requirements]
+                    for part in self.current_uniform_requirements:
+                        key = part.lower()
+                        if key in self.requirement_checkboxes:
+                            var = self.requirement_checkboxes[key]['var']
+                            checkbox_widget = self.requirement_checkbox_widgets.get(key)
+                            
+                            # Check if requirement is permanently checked
+                            if key in self._permanently_checked_requirements:
+                                var.set(True)
+                                if checkbox_widget:
+                                    checkbox_widget.config(text=part)
+                            else:
+                                var.set(False)
+                                if checkbox_widget:
+                                    checkbox_widget.config(text=f"✗ {part}")
+                
+                # Keep status as "Complete uniform"
+                if hasattr(self, 'requirements_status_label'):
+                    self.requirements_status_label.config(text="Complete uniform", fg='#059669')
+                
+                return  # Exit early - don't process current detections
+            
             required = [p.lower() for p in self.current_uniform_requirements]
             present = set()
             
@@ -13090,6 +14434,17 @@ class GuardMainControl:
                 if not self.uniform_detection_complete:
                     self.uniform_detection_complete = True
                     print(f"✅ All uniform requirements detected - timer will stop")
+                    # CRITICAL: Mark ALL requirements that have been detected at least once as permanently checked
+                    # This ensures all detected requirements stay checked even after detection stops
+                    if not hasattr(self, '_permanently_checked_requirements'):
+                        self._permanently_checked_requirements = set()
+                    # Add all requirements that have been detected (count > 0) to permanently checked
+                    for req in required:
+                        # Check if requirement was detected at least once
+                        detection_count = self._requirement_detection_counts.get(req, 0)
+                        if detection_count > 0 or req in present:
+                            self._permanently_checked_requirements.add(req)
+                            print(f"✅ Requirement '{req}' marked as permanently checked (complete uniform, detected {detection_count} times)")
                     # Handle complete uniform - record entry and stop detection
                     self._handle_complete_uniform_detected()
             else:
@@ -13232,31 +14587,38 @@ class GuardMainControl:
             self._requirement_detection_counts = {}
             self._permanently_checked_requirements = set()
             
-            # CRITICAL: Enable APPROVE and CANCEL buttons when incomplete uniform is detected
-            # Store student info for APPROVE and CANCEL button handlers
+            # CRITICAL: Enable all buttons when incomplete uniform is detected (first entry)
+            # This is the first entry attempt, so student hasn't entered yet
+            # All buttons should be enabled regardless of previous violations
+            # Store student info for button handlers
+            self.incomplete_student_info_for_approve = student_info
+            
+            # Enable all buttons (APPROVE, CANCEL, DENIED) for first entry
             if hasattr(self, 'approve_button'):
                 try:
-                    self.incomplete_student_info_for_approve = student_info  # Store for APPROVE and CANCEL buttons
                     self.approve_button.config(state=tk.NORMAL)  # Enable APPROVE button
-                    print(f"✅ APPROVE button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')}")
+                    print(f"✅ APPROVE button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')} (first entry)")
                 except Exception as e:
                     print(f"⚠️ WARNING: Could not enable APPROVE button: {e}")
             
-            # Enable CANCEL button when incomplete uniform is detected
             if hasattr(self, 'cancel_button'):
                 try:
                     self.cancel_button.config(state=tk.NORMAL)  # Enable CANCEL button
-                    print(f"✅ CANCEL button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')}")
+                    print(f"✅ CANCEL button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')} (first entry)")
                 except Exception as e:
                     print(f"⚠️ WARNING: Could not enable CANCEL button: {e}")
             
-            # Enable DENIED button when incomplete uniform is detected (new RFID tap)
             if hasattr(self, 'deny_button'):
                 try:
-                    self.deny_button.config(state=tk.NORMAL)
-                    print(f"✅ DENIED button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')}")
+                    self.deny_button.config(state=tk.NORMAL)  # Enable DENIED button
+                    print(f"✅ DENIED button enabled - incomplete uniform detected for {student_info.get('name', 'Unknown')} (first entry)")
                 except Exception as e:
                     print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+            
+            # Enable checkboxes immediately when incomplete uniform is detected
+            # This allows guard to manually check off items they can see are present
+            self._make_requirement_checkboxes_editable(True)
+            print(f"✅ Requirement checkboxes enabled - guard can now manually check items")
             
             # Reset RFID status tracker on timeout (timeout = exit, so clear entry status)
             # This ensures tapping ID again after timeout will be treated as fresh start
@@ -13296,86 +14658,48 @@ class GuardMainControl:
             try:
                 student_id = student_info.get('student_id') or student_info.get('student_number')
                 if student_id:
-                    # Get missing items from requirements tracking system (primary source)
+                    # Get missing items ONLY from requirement checkboxes if guard has manually interacted with them
+                    # CRITICAL: Do NOT use tracker's get_missing_components() - it lists all unconfirmed required parts,
+                    # not just actual missing items. Checkboxes start unchecked, so we can only trust them if guard
+                    # has manually checked at least one item (indicating they've reviewed and confirmed what's present).
                     missing_items = []
                     try:
-                        # Get correct requirements for THIS student based on their course/gender
-                        course = student_info.get('course', '')
-                        gender = student_info.get('gender', '')
-                        
-                        # Determine which preset to use for this student
-                        course_upper = (course or "").upper()
-                        gender_lower = (gender or "").lower()
-                        
-                        if "SHS" in course_upper or "SENIOR HIGH" in course_upper:
-                            uniform_key = 'SHS'
-                        elif "BSHM" in course_upper or "HOSPITALITY" in course_upper:
-                            if gender_lower.startswith('f'):
-                                uniform_key = 'BSHM_FEMALE'
+                        # Only use requirement checkboxes if guard has manually interacted (checked at least one item)
+                        if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
+                            checked_count = 0
+                            for req_name, checkbox_data in self.requirement_checkboxes.items():
+                                # checkbox_data is a dict with 'var' (BooleanVar) and 'part' (string)
+                                if isinstance(checkbox_data, dict) and 'var' in checkbox_data:
+                                    var = checkbox_data['var']
+                                    if isinstance(var, tk.BooleanVar):
+                                        if var.get():  # Checked = present
+                                            checked_count += 1
+                            
+                            # Only use checkboxes if guard has manually checked at least one item
+                            # This indicates they've reviewed and we can trust unchecked items as actually missing
+                            if checked_count > 0:
+                                for req_name, checkbox_data in self.requirement_checkboxes.items():
+                                    if isinstance(checkbox_data, dict) and 'var' in checkbox_data:
+                                        var = checkbox_data['var']
+                                        if isinstance(var, tk.BooleanVar):
+                                            if not var.get():  # Unchecked = missing (only if guard has reviewed)
+                                                part_name = checkbox_data.get('part', req_name)
+                                                missing_items.append(part_name)
+                                if missing_items:
+                                    print(f"✅ Retrieved missing items from requirement checkboxes (guard reviewed): {missing_items}")
                             else:
-                                uniform_key = 'BSHM_MALE'
-                        elif "BSCPE" in course_upper:
-                            # BSCPE requirements
-                            if gender_lower.startswith('f'):
-                                uniform_key = 'BSCPE_MALE'  # BSCPE_FEMALE not defined yet
-                            else:
-                                uniform_key = 'BSCPE_MALE'
-                        elif "ARTS" in course_upper and "SCIENCE" in course_upper:
-                            # Arts and Science requirements
-                            uniform_key = 'ARTS_AND_SCIENCE'
-                        elif "TOURISM" in course_upper:
-                            uniform_key = 'TOURISM'
+                                print(f"⚠️ Guard has not manually reviewed checkboxes - cannot determine missing items accurately")
+                                print(f"   - Leaving missing_items empty to avoid storing incorrect data")
                         else:
-                            uniform_key = 'SHS'  # Default
+                            print(f"⚠️ Requirement checkboxes not available - cannot determine missing items")
                         
-                        # Get requirements for this student
-                        required = list(self.uniform_requirements_presets.get(uniform_key, []))
-                        permanently_checked = getattr(self, '_permanently_checked_requirements', set())
-                        
-                        # Calculate missing items (requirements not permanently checked)
-                        # Normalize both sides for comparison - permanently_checked stores lowercase, required has original case
-                        required_lower = [r.lower() for r in required]
-                        permanently_checked_lower = [p.lower() for p in permanently_checked]
-                        
-                        # Only include items that are NOT detected (not in permanently_checked)
-                        # CRITICAL: Items that ARE detected (checked) should NOT be in missing_items
-                        missing_items = []
-                        for req, req_lower in zip(required, required_lower):
-                            if req_lower not in permanently_checked_lower:
-                                missing_items.append(req)
-                            else:
-                                print(f"✅ Item '{req}' is detected (checked) - EXCLUDED from missing items")
-                        
-                        print(f"✅ Retrieved missing items from requirements tracking for {uniform_key}: {missing_items}")
-                        print(f"   - Student course: {course}, gender: {gender}")
-                        print(f"   - Required: {required}")
-                        print(f"   - Permanently checked: {list(permanently_checked)}")
-                        print(f"   - Required (lowercase): {required_lower}")
-                        print(f"   - Permanently checked (lowercase): {permanently_checked_lower}")
-                        print(f"   - Missing items (NOT detected, will be saved to Firebase): {missing_items}")
-                        
-                        # Fallback: Try to get from detection system if requirements tracking is empty
-                        if not missing_items or len(missing_items) == 0:
-                            try:
-                                if hasattr(self, 'detection_system') and self.detection_system:
-                                    detection_service = getattr(self.detection_system, 'detection_service', None)
-                                    if detection_service:
-                                        # Try to get missing items from uniform tracker
-                                        if hasattr(detection_service, 'uniform_tracker'):
-                                            tracker = detection_service.uniform_tracker
-                                            if hasattr(tracker, 'get_missing_components'):
-                                                missing_items = tracker.get_missing_components()
-                                                print(f"✅ Retrieved missing items from uniform tracker (fallback): {missing_items}")
-                                        # Also try to get from improved tracker
-                                        elif hasattr(detection_service, 'improved_tracker'):
-                                            tracker = detection_service.improved_tracker
-                                            if hasattr(tracker, 'get_missing_components'):
-                                                missing_items = tracker.get_missing_components()
-                                                print(f"✅ Retrieved missing items from improved tracker (fallback): {missing_items}")
-                            except Exception as e:
-                                print(f"⚠️ Warning: Could not get missing items from detection system: {e}")
+                        if missing_items:
+                            print(f"✅ Using missing_items for violation history: {missing_items}")
+                            print(f"   - Only actual missing items (from guard's manual review) will be stored")
+                        else:
+                            print(f"⚠️ No missing_items to store - better to leave empty than store incorrect data")
                     except Exception as e:
-                        print(f"⚠️ Warning: Could not get missing items from requirements tracking: {e}")
+                        print(f"⚠️ Warning: Could not get missing items from checkboxes: {e}")
                         missing_items = []
                     
                     violation_details = "Uniform incomplete after 15-second timeout - required uniform parts not detected"
@@ -13556,7 +14880,7 @@ class GuardMainControl:
             # Reset DENIED button text and command to original
             if hasattr(self, 'deny_button') and self.deny_button:
                 self.deny_button.config(
-                    text="DENIED\n(Keep Locked)",
+                    text="DENIED",
                     command=self.handle_interface_deny
                 )
             
@@ -13605,9 +14929,11 @@ class GuardMainControl:
             # Don't schedule hiding - requirements stay visible until guard clicks a button
             print(f"✅ Requirements section remains visible until gate control button is clicked")
             
-            # Reset detection tracking variables
+            # Reset detection tracking counts but PRESERVE permanently checked requirements
+            # This ensures checkboxes stay checked even after detection completes
             self._requirement_detection_counts = {}
-            self._permanently_checked_requirements = set()
+            # DO NOT reset _permanently_checked_requirements - preserve checked state
+            # self._permanently_checked_requirements = set()  # REMOVED - preserve checked requirements
             
             # Clear incomplete student info and disable approve complete uniform button since uniform is now complete
             self.incomplete_student_info_for_retry = None
@@ -13898,7 +15224,7 @@ class GuardMainControl:
         # Approve button - DISABLED by default, only enabled when incomplete uniform is detected
         self.approve_button = tk.Button(
             buttons_frame,
-            text="ACCESS GRANTED\n(Unlock Gate)",
+            text="ACCESS GRANTED",
             font=('Arial', 9, 'bold'),
             bg='#10b981',
             fg='white',
@@ -13940,7 +15266,7 @@ class GuardMainControl:
         # Deny button
         self.deny_button = tk.Button(
             buttons_frame,
-            text="DENIED\n(Keep Locked)",
+            text="DENIED",
             font=('Arial', 9, 'bold'),
             bg='#dc2626',
             fg='white',
@@ -13969,6 +15295,81 @@ class GuardMainControl:
     def clear_main_screen_after_gate_action(self):
         """Clear main screen after gate control button is clicked"""
         try:
+            # CRITICAL: If entry was just saved, schedule a 15-second timer to clear main screen
+            # Check if entry was recently saved by checking if detection_active is False and uniform_detection_complete is True
+            if hasattr(self, 'detection_active') and not self.detection_active:
+                if hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete:
+                    # Entry was just processed - schedule 15-second timer to clear main screen
+                    print(f"✅ Entry was just saved - scheduling 15-second timer to return to standby")
+                    
+                    # Cancel any pending auto-clear timer
+                    if hasattr(self, 'main_screen_clear_timer') and self.main_screen_clear_timer is not None:
+                        try:
+                            self.root.after_cancel(self.main_screen_clear_timer)
+                        except Exception:
+                            pass
+                        self.main_screen_clear_timer = None
+                    
+                    # Clear violation flags
+                    self.incomplete_student_info_for_approve = None
+                    
+                    # CRITICAL: Clear active_session_violations to prevent blocking the clear timer
+                    # Violations have already been finalized and saved to Firebase
+                    if hasattr(self, 'active_session_violations') and self.active_session_violations:
+                        # Get current RFID if available
+                        current_rfid = getattr(self, 'current_rfid_for_timer', None)
+                        if current_rfid and current_rfid in self.active_session_violations:
+                            del self.active_session_violations[current_rfid]
+                            print(f"✅ Cleared active_session_violations for RFID {current_rfid} (violations already finalized)")
+                        # Also clear any remaining violations (defensive)
+                        self.active_session_violations.clear()
+                        print(f"✅ Cleared all active_session_violations (entry was saved)")
+                    
+                    # CRITICAL: Check if this is an approved violation entry (re-entry scenario)
+                    # For approved violation entries, DENIED button should stay enabled for at least 10 seconds
+                    # Don't reset denied button state immediately - it will be disabled by the 10-second timer
+                    # Check if DENIED button is currently enabled (indicates approved violation re-entry)
+                    is_approved_violation_entry = False
+                    if hasattr(self, 'deny_button') and self.deny_button:
+                        try:
+                            current_state = self.deny_button.cget('state')
+                            if current_state == tk.NORMAL:
+                                # DENIED is enabled - this might be an approved violation entry
+                                # Check if we have an approved violation flag (student_id check)
+                                is_approved_violation_entry = True
+                                print(f"⏸️ DENIED button is enabled - skipping immediate reset (will be disabled after 10 seconds)")
+                        except Exception:
+                            pass
+                    
+                    # Reset denied button state only if NOT an approved violation entry
+                    # For approved violation entries, DENIED will be disabled by the 10-second timer
+                    if not is_approved_violation_entry:
+                        self._reset_denied_button_state()
+                    else:
+                        # For approved violation entries, only reset the state flags, don't disable buttons
+                        self.denied_button_clicked = False
+                        self.original_detection_state = None
+                        self.original_uniform_status = None
+                        print(f"✅ Reset denied button state flags (DENIED button will stay enabled for 10 seconds)")
+                    
+                    # Make checkboxes read-only
+                    self._make_requirement_checkboxes_editable(False)
+                    
+            # Schedule 15-second timer to clear main screen and return to standby
+            # CRITICAL: Cancel any existing timer first to avoid conflicts
+            if hasattr(self, 'main_screen_clear_timer') and self.main_screen_clear_timer is not None:
+                try:
+                    self.root.after_cancel(self.main_screen_clear_timer)
+                    print(f"🔍 Cancelled existing main screen clear timer before scheduling new one")
+                except Exception:
+                    pass
+            
+            self.main_screen_clear_timer = self.root.after(15000, self._clear_main_screen_after_delay)
+            print(f"✅ Scheduled main screen clear after 15 seconds (entry was saved) - timer ID: {self.main_screen_clear_timer}")
+            
+            return  # Exit early - don't clear main screen immediately
+            
+            # Normal clear behavior (for CANCEL, DENIED without entry, etc.)
             # Cancel any pending auto-clear timer
             if hasattr(self, 'main_screen_clear_timer') and self.main_screen_clear_timer is not None:
                 try:
@@ -14025,6 +15426,103 @@ class GuardMainControl:
                 self.original_uniform_status == 'incomplete'
             )
             
+            # Check if this is approved violation re-entry scenario (after DENIED clicked)
+            is_approved_violation_scenario = (
+                is_denied_clicked_scenario and
+                hasattr(self, 'approved_violation_student_info') and 
+                self.approved_violation_student_info is not None
+            )
+            
+            # Handle approved violation re-entry scenario first
+            if is_approved_violation_scenario:
+                # Approved violation re-entry: Entry without new violation (violation already stored in Firebase)
+                print("SUCCESS: Interface Approve button pressed - Entry without new violation (approved violation re-entry)")
+                self.add_activity_log("Interface Approve button pressed - Entry without new violation (approved violation re-entry)")
+                
+                # Get student info
+                student_info = self.approved_violation_student_info
+                current_rfid = self.approved_violation_rfid
+                
+                if not current_rfid or not student_info:
+                    print(f"⚠️ WARNING: Cannot process APPROVE - missing RFID or student info")
+                    messagebox.showerror("Error", "Cannot process approve - missing student information")
+                    return
+                
+                # CRITICAL: Reset detection flags BEFORE recording entry
+                try:
+                    self.detection_active = False
+                    self.uniform_detection_complete = True
+                    print(f"✅ Detection flags reset BEFORE recording entry: detection_active=False, uniform_detection_complete=True")
+                    
+                    # Clear detection session tracking
+                    if current_rfid in self.active_detection_sessions:
+                        del self.active_detection_sessions[current_rfid]
+                        print(f"✅ Cleared detection session for RFID {current_rfid}")
+                    
+                    # Stop any running detection
+                    if hasattr(self, 'detection_system') and self.detection_system:
+                        self.detection_system.stop_detection()
+                        print(f"✅ Stopped detection system after approved violation approval")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not reset detection flags: {e}")
+                
+                # Record entry without new violation (re-entry, violation already stored)
+                self.record_complete_uniform_entry(current_rfid, student_info)
+                
+                # Open gate
+                self.open_gate()
+                
+                # Update gate status
+                self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+                
+                # Show success message
+                self.show_green_success_message("Entry Approved (No New Violation)", 
+                                  "SUCCESS: Entry recorded WITHOUT new violation\n"
+                                  "🚪 Gate is opening\n"
+                                  "👤 Student may proceed\n"
+                                  "✅ Re-entry allowed (violation already stored)")
+                
+                # Reset GRANTED button back to DENIED
+                if hasattr(self, 'deny_button') and self.deny_button:
+                    try:
+                        self.deny_button.config(
+                            text="DENIED",
+                            command=self.handle_interface_deny,
+                            state=tk.DISABLED
+                        )
+                        print(f"✅ GRANTED button reset to DENIED (approved violation re-entry granted)")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not reset GRANTED button: {e}")
+                
+                # Disable all buttons
+                if hasattr(self, 'approve_button') and self.approve_button:
+                    self.approve_button.config(state=tk.DISABLED)
+                if hasattr(self, 'cancel_button') and self.cancel_button:
+                    self.cancel_button.config(state=tk.DISABLED)
+                
+                # Reset denied button state flags
+                self.denied_button_clicked = False
+                self.original_detection_state = None
+                self.original_uniform_status = None
+                
+                # Clear approved violation info
+                self.approved_violation_student_info = None
+                self.approved_violation_rfid = None
+                
+                # Make checkboxes read-only again
+                self._make_requirement_checkboxes_editable(False)
+                
+                # Hide requirements section
+                self.hide_requirements_section()
+                
+                # Schedule 15-second timer to clear main screen
+                self.clear_main_screen_after_gate_action()
+                
+                # Schedule status update after unlock duration
+                self.root.after(3500, self.update_gate_status_locked)
+                
+                return
+            
             if is_complete_uniform_scenario:
                 # Complete uniform scenario: Entry with violation (incorrect uniform)
                 print("SUCCESS: Interface Approve button pressed - Entry with violation (complete uniform scenario)")
@@ -14049,13 +15547,81 @@ class GuardMainControl:
                     messagebox.showerror("Error", "Cannot process approve - missing student information")
                     return
                 
+                # CRITICAL: Stop detection before processing entry
+                try:
+                    if hasattr(self, 'detection_system') and self.detection_system:
+                        self.detection_system.stop_detection()
+                        print(f"🛑 Stopped detection system before processing ACCESS GRANTED")
+                    self.detection_active = False
+                    # Don't set uniform_detection_complete yet - it will be set to True after entry is saved
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not stop detection: {e}")
+                
+                # CRITICAL: Ensure violations exist in active_session_violations before calling handle_approve_button
+                # If DENIED was clicked early during detection, violations might not be in active_session_violations yet
+                if current_rfid not in getattr(self, 'active_session_violations', {}) or len(getattr(self, 'active_session_violations', {}).get(current_rfid, [])) == 0:
+                    print(f"⚠️ WARNING: No violations found in active_session_violations - creating violation entry manually")
+                    # Create a violation entry based on manual checkbox selections or generic violation
+                    if current_rfid not in getattr(self, 'active_session_violations', {}):
+                        self.active_session_violations[current_rfid] = []
+                    
+                    # Get missing items from requirement checkboxes if available
+                    missing_items = []
+                    if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
+                        for req_name, checkbox_data in self.requirement_checkboxes.items():
+                            # checkbox_data is a dict with 'var' (BooleanVar) and 'part' (string)
+                            if isinstance(checkbox_data, dict) and 'var' in checkbox_data:
+                                var = checkbox_data['var']
+                                if isinstance(var, tk.BooleanVar):
+                                    if not var.get():  # Unchecked = missing
+                                        part_name = checkbox_data.get('part', req_name)
+                                        missing_items.append(part_name)
+                    
+                    # Create violation entry
+                    violation_entry = {
+                        'student_id': student_info.get('student_id') or student_info.get('student_number'),
+                        'violation_type': 'incomplete_uniform',
+                        'timestamp': self.get_current_timestamp(),
+                        'details': 'Incomplete uniform violation (guard approved with violation after DENIED)',
+                        'student_info': student_info,
+                        'missing_items': missing_items if missing_items else ['Uniform violation detected']
+                    }
+                    self.active_session_violations[current_rfid].append(violation_entry)
+                    print(f"✅ Created violation entry manually for ACCESS GRANTED after DENIED (complete uniform scenario)")
+                
                 # Entry with violation (guard sees problem)
                 entry_saved = self.handle_approve_button()
                 
                 if entry_saved:
                     print(f"✅ Entry with violation saved successfully")
+                    
+                    # CRITICAL: Verify entry record is saved before allowing next tap
+                    import time
+                    verify_entry = False
+                    for attempt in range(3):
+                        delay = 0.5 + (attempt * 0.3)  # 0.5s, 0.8s, 1.1s
+                        time.sleep(delay)
+                        verify_entry = self.check_student_has_entry_record(current_rfid)
+                        if verify_entry:
+                            print(f"✅ VERIFIED: Entry record confirmed in Firebase (attempt {attempt + 1}) - next tap will be EXIT")
+                            break
+                        else:
+                            print(f"⚠️ Attempt {attempt + 1}: Entry record not yet found, retrying...")
+                    
+                    if not verify_entry:
+                        print(f"⚠️ WARNING: Entry record not found after 3 attempts - may need more time")
+                    else:
+                        print(f"✅ SUCCESS: Entry verified in Firebase - next tap will timeout (EXIT)")
                 else:
                     print(f"⚠️ WARNING: Entry may not have been saved")
+                
+                # CRITICAL: Clear detection session to prevent restart on next tap
+                try:
+                    if current_rfid in getattr(self, 'active_detection_sessions', {}):
+                        del self.active_detection_sessions[current_rfid]
+                        print(f"✅ Cleared detection session for RFID {current_rfid}")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not clear detection session: {e}")
                 
                 # Send approve command to Arduino
                 self.send_arduino_command("APPROVE")
@@ -14073,9 +15639,12 @@ class GuardMainControl:
                                   "👤 Student may proceed\n"
                                   "⚠️ Violation recorded")
                 
-                # Update main screen
-                if self.main_screen_window and self.main_screen_window.winfo_exists():
-                    self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (WITH VIOLATION)")
+                # CRITICAL: Schedule 15-second timer to clear main screen and return to standby
+                # This ensures the entry status is displayed for 15 seconds, then returns to standby
+                self.clear_main_screen_after_gate_action()
+                
+                # NOTE: handle_approve_button() already updates main screen with entry status
+                # Don't overwrite it with gate status - entry status is more important
             elif is_incomplete_uniform_scenario:
                 # Incomplete uniform scenario after DENIED clicked: Entry with violation
                 print("SUCCESS: Interface Approve button pressed - Entry with violation (incomplete uniform after DENIED)")
@@ -14100,13 +15669,100 @@ class GuardMainControl:
                     messagebox.showerror("Error", "Cannot process approve - missing student information")
                     return
                 
+                # CRITICAL: Stop detection before processing entry
+                try:
+                    if hasattr(self, 'detection_system') and self.detection_system:
+                        self.detection_system.stop_detection()
+                        print(f"🛑 Stopped detection system before processing ACCESS GRANTED")
+                    self.detection_active = False
+                    # Don't set uniform_detection_complete yet - it will be set to True after entry is saved
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not stop detection: {e}")
+                
+                # CRITICAL: Ensure violations exist in active_session_violations before calling handle_approve_button
+                # If DENIED was clicked early during detection, violations might not be in active_session_violations yet
+                if current_rfid not in getattr(self, 'active_session_violations', {}) or len(getattr(self, 'active_session_violations', {}).get(current_rfid, [])) == 0:
+                    print(f"⚠️ WARNING: No violations found in active_session_violations - creating violation entry manually")
+                    # Create a violation entry based on manual checkbox selections or generic violation
+                    if current_rfid not in getattr(self, 'active_session_violations', {}):
+                        self.active_session_violations[current_rfid] = []
+                    
+                    # Get missing items from requirement checkboxes if available
+                    missing_items = []
+                    if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
+                        for req_name, checkbox_data in self.requirement_checkboxes.items():
+                            # checkbox_data is a dict with 'var' (BooleanVar) and 'part' (string)
+                            if isinstance(checkbox_data, dict) and 'var' in checkbox_data:
+                                var = checkbox_data['var']
+                                if isinstance(var, tk.BooleanVar):
+                                    if not var.get():  # Unchecked = missing
+                                        part_name = checkbox_data.get('part', req_name)
+                                        missing_items.append(part_name)
+                    
+                    # Create violation entry
+                    violation_entry = {
+                        'student_id': student_info.get('student_id') or student_info.get('student_number'),
+                        'violation_type': 'incomplete_uniform',
+                        'timestamp': self.get_current_timestamp(),
+                        'details': 'Incomplete uniform violation (guard approved with violation)',
+                        'student_info': student_info,
+                        'missing_items': missing_items if missing_items else ['Uniform violation detected']
+                    }
+                    self.active_session_violations[current_rfid].append(violation_entry)
+                    print(f"✅ Created violation entry manually for ACCESS GRANTED after DENIED")
+                
+                # Debug: Check if violations were created
+                print(f"🔍 DEBUG: Checking violations before handle_approve_button")
+                print(f"   Current RFID: {current_rfid}")
+                print(f"   active_session_violations keys: {list(getattr(self, 'active_session_violations', {}).keys())}")
+                if current_rfid in getattr(self, 'active_session_violations', {}):
+                    print(f"   Violations for {current_rfid}: {len(getattr(self, 'active_session_violations', {}).get(current_rfid, []))}")
+                    for i, v in enumerate(getattr(self, 'active_session_violations', {}).get(current_rfid, [])):
+                        print(f"     Violation {i+1}: {v.get('violation_type', 'unknown')} - {v.get('details', 'no details')}")
+                else:
+                    print(f"   ⚠️ WARNING: RFID {current_rfid} not found in active_session_violations!")
+                
                 # Entry with violation (guard sees problem with incomplete uniform)
-                entry_saved = self.handle_approve_button()
+                try:
+                    entry_saved = self.handle_approve_button()
+                    print(f"🔍 DEBUG: handle_approve_button returned: {entry_saved}")
+                except Exception as e:
+                    print(f"❌ ERROR: Exception in handle_approve_button: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    messagebox.showerror("Error", f"Failed to process entry: {e}")
+                    entry_saved = False
                 
                 if entry_saved:
                     print(f"✅ Entry with violation saved successfully")
+                    
+                    # CRITICAL: Verify entry record is saved before allowing next tap
+                    import time
+                    verify_entry = False
+                    for attempt in range(3):
+                        delay = 0.5 + (attempt * 0.3)  # 0.5s, 0.8s, 1.1s
+                        time.sleep(delay)
+                        verify_entry = self.check_student_has_entry_record(current_rfid)
+                        if verify_entry:
+                            print(f"✅ VERIFIED: Entry record confirmed in Firebase (attempt {attempt + 1}) - next tap will be EXIT")
+                            break
+                        else:
+                            print(f"⚠️ Attempt {attempt + 1}: Entry record not yet found, retrying...")
+                    
+                    if not verify_entry:
+                        print(f"⚠️ WARNING: Entry record not found after 3 attempts - may need more time")
+                    else:
+                        print(f"✅ SUCCESS: Entry verified in Firebase - next tap will timeout (EXIT)")
                 else:
-                    print(f"⚠️ WARNING: Entry may not have been saved")
+                    print(f"⚠️ WARNING: Entry may not have been saved - handle_approve_button returned False")
+                
+                # CRITICAL: Clear detection session to prevent restart on next tap
+                try:
+                    if current_rfid in getattr(self, 'active_detection_sessions', {}):
+                        del self.active_detection_sessions[current_rfid]
+                        print(f"✅ Cleared detection session for RFID {current_rfid}")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not clear detection session: {e}")
                 
                 # Send approve command to Arduino
                 self.send_arduino_command("APPROVE")
@@ -14124,21 +15780,115 @@ class GuardMainControl:
                                   "👤 Student may proceed\n"
                                   "⚠️ Violation recorded")
                 
-                # Update main screen
+                # CRITICAL: Schedule 15-second timer to clear main screen and return to standby
+                # This ensures the entry status is displayed for 15 seconds, then returns to standby
+                self.clear_main_screen_after_gate_action()
+                
+                # NOTE: handle_approve_button() already updates main screen with entry status
+                # Don't overwrite it with gate status - entry status is more important
+                # Only update gate status if main screen wasn't updated by handle_approve_button
                 if self.main_screen_window and self.main_screen_window.winfo_exists():
-                    self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (WITH VIOLATION)")
+                    # Check if main screen was already updated by handle_approve_button
+                    # If not, update with gate status as fallback
+                    try:
+                        # handle_approve_button should have called update_main_screen_with_permanent_student
+                        # which shows entry status - don't overwrite it
+                        pass  # Don't call update_main_screen_with_gate_status - it would overwrite entry status
+                    except Exception as e:
+                        print(f"⚠️ Warning: Could not check main screen update: {e}")
             else:
                 # Normal incomplete uniform scenario (DENIED not clicked)
                 print("SUCCESS: Interface Approve button pressed - Unlocking gate")
                 self.add_activity_log("Interface Approve button pressed - Unlocking gate")
+                
+                # Get student info for verification
+                student_info = None
+                current_rfid = None
+                
+                if hasattr(self, 'incomplete_student_info_for_approve') and self.incomplete_student_info_for_approve:
+                    student_info = self.incomplete_student_info_for_approve
+                    current_rfid = student_info.get('rfid')
+                
+                if not current_rfid and hasattr(self, 'current_rfid_for_timer'):
+                    current_rfid = self.current_rfid_for_timer
+                
+                # CRITICAL: Stop detection before processing entry
+                try:
+                    if hasattr(self, 'detection_system') and self.detection_system:
+                        self.detection_system.stop_detection()
+                        print(f"🛑 Stopped detection system before processing ACCESS GRANTED")
+                    self.detection_active = False
+                    # Don't set uniform_detection_complete yet - it will be set to True after entry is saved
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not stop detection: {e}")
+                
+                # CRITICAL: Ensure violations exist in active_session_violations before calling handle_approve_button
+                # If detection completed but violations weren't stored, create them now
+                if current_rfid and (current_rfid not in getattr(self, 'active_session_violations', {}) or len(getattr(self, 'active_session_violations', {}).get(current_rfid, [])) == 0):
+                    print(f"⚠️ WARNING: No violations found in active_session_violations - creating violation entry manually")
+                    # Create a violation entry
+                    if current_rfid not in getattr(self, 'active_session_violations', {}):
+                        self.active_session_violations[current_rfid] = []
+                    
+                    # Get missing items from requirement checkboxes if available
+                    missing_items = []
+                    if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
+                        for req_name, checkbox_data in self.requirement_checkboxes.items():
+                            # checkbox_data is a dict with 'var' (BooleanVar) and 'part' (string)
+                            if isinstance(checkbox_data, dict) and 'var' in checkbox_data:
+                                var = checkbox_data['var']
+                                if isinstance(var, tk.BooleanVar):
+                                    if not var.get():  # Unchecked = missing
+                                        part_name = checkbox_data.get('part', req_name)
+                                        missing_items.append(part_name)
+                    
+                    # Create violation entry
+                    violation_entry = {
+                        'student_id': student_info.get('student_id') or student_info.get('student_number') if student_info else None,
+                        'violation_type': 'incomplete_uniform',
+                        'timestamp': self.get_current_timestamp(),
+                        'details': 'Incomplete uniform violation (guard approved with violation)',
+                        'student_info': student_info,
+                        'missing_items': missing_items if missing_items else ['Uniform violation detected']
+                    }
+                    self.active_session_violations[current_rfid].append(violation_entry)
+                    print(f"✅ Created violation entry manually for ACCESS GRANTED")
                 
                 # CRITICAL: Call handle_approve_button() to save entry to Firebase, update main screen, and add to recent entries
                 entry_saved = self.handle_approve_button()
                 
                 if entry_saved:
                     print(f"✅ Entry saved successfully via handle_approve_button()")
+                    
+                    # CRITICAL: Verify entry record is saved before allowing next tap
+                    if current_rfid:
+                        import time
+                        verify_entry = False
+                        for attempt in range(3):
+                            delay = 0.5 + (attempt * 0.3)  # 0.5s, 0.8s, 1.1s
+                            time.sleep(delay)
+                            verify_entry = self.check_student_has_entry_record(current_rfid)
+                            if verify_entry:
+                                print(f"✅ VERIFIED: Entry record confirmed in Firebase (attempt {attempt + 1}) - next tap will be EXIT")
+                                break
+                            else:
+                                print(f"⚠️ Attempt {attempt + 1}: Entry record not yet found, retrying...")
+                        
+                        if not verify_entry:
+                            print(f"⚠️ WARNING: Entry record not found after 3 attempts - may need more time")
+                        else:
+                            print(f"✅ SUCCESS: Entry verified in Firebase - next tap will timeout (EXIT)")
                 else:
                     print(f"⚠️ WARNING: handle_approve_button() returned False - entry may not have been saved")
+                
+                # CRITICAL: Clear detection session to prevent restart on next tap
+                if current_rfid:
+                    try:
+                        if current_rfid in getattr(self, 'active_detection_sessions', {}):
+                            del self.active_detection_sessions[current_rfid]
+                            print(f"✅ Cleared detection session for RFID {current_rfid}")
+                    except Exception as e:
+                        print(f"⚠️ Warning: Could not clear detection session: {e}")
                 
                 # Send approve command to Arduino
                 self.send_arduino_command("APPROVE")
@@ -14155,9 +15905,12 @@ class GuardMainControl:
                                   "🚪 Person may proceed\n"
                                   "✅ Entry recorded with violation")
                 
-                # Update main screen (handle_approve_button already updates it, but this ensures gate status is updated)
-                if self.main_screen_window and self.main_screen_window.winfo_exists():
-                    self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED")
+                # CRITICAL: Schedule 15-second timer to clear main screen and return to standby
+                # This ensures the entry status is displayed for 15 seconds, then returns to standby
+                self.clear_main_screen_after_gate_action()
+                
+                # NOTE: handle_approve_button() already updates main screen with entry status
+                # Don't overwrite it with gate status - entry status is more important
             
             # Reset all button states after processing
             self._reset_denied_button_state()
@@ -14177,11 +15930,30 @@ class GuardMainControl:
             self.incomplete_student_info_for_approve = None
             self.complete_uniform_student_info = None
             
-            # Hide requirements section after gate control action
-            self.hide_requirements_section()
+            # CRITICAL: Only hide requirements section and clear main screen if entry was NOT saved
+            # If entry was saved, keep the entry status visible on main screen
+            # Check if entry was saved by checking detection flags (entry was saved if detection_active is False and uniform_detection_complete is True)
+            entry_was_saved = (
+                hasattr(self, 'detection_active') and not self.detection_active and
+                hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete
+            )
             
-            # Clear main screen after gate control action (violation resolved)
-            self.clear_main_screen_after_gate_action()
+            if not entry_was_saved:
+                # Entry was not saved - hide requirements and clear main screen
+                self.hide_requirements_section()
+                self.clear_main_screen_after_gate_action()
+            else:
+                # Entry was saved - just hide requirements section (don't clear main screen)
+                # The main screen should show entry status
+                try:
+                    if hasattr(self, 'requirements_frame') and self.requirements_frame:
+                        self.requirements_frame.pack_forget()
+                        # Clear student info label when hiding
+                        if hasattr(self, 'requirements_student_info_label') and self.requirements_student_info_label:
+                            self.requirements_student_info_label.config(text="")
+                        print(f"✅ Requirements section hidden (entry status remains visible on main screen)")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not hide requirements section: {e}")
             
             # Schedule status update after unlock duration
             self.root.after(3500, self.update_gate_status_locked)
@@ -14193,18 +15965,100 @@ class GuardMainControl:
             traceback.print_exc()
     
     def handle_interface_cancel(self):
-        """Handle cancel button press - Three functions:
+        """Handle cancel button press - Four functions:
         1. If denied_button_clicked (complete uniform): Permanently lock gate and return to standby
         2. If denied_button_clicked (incomplete uniform): Lock gate and return to standby
-        3. If not: Entry without violation (bypass incomplete uniform)
+        3. If denied_button_clicked (approved violation re-entry): Lock gate quickly and return to standby
+        4. If not: Entry without violation (bypass incomplete uniform)
         """
         try:
+            # CRITICAL: Check if this is approved violation re-entry scenario
+            is_approved_violation_scenario = (
+                hasattr(self, 'approved_violation_student_info') and 
+                self.approved_violation_student_info is not None
+            )
+            
             # Check if DENIED was clicked - if so, lock gate and return to standby
             if hasattr(self, 'denied_button_clicked') and self.denied_button_clicked:
                 is_complete_uniform = (
                     hasattr(self, 'original_uniform_status') and 
                     self.original_uniform_status == 'complete'
                 )
+                
+                # Handle approved violation re-entry scenario first
+                if is_approved_violation_scenario:
+                    print("INFO: Cancel button pressed after DENIED (approved violation re-entry) - Locking gate quickly and returning to standby")
+                    self.add_activity_log("Cancel button pressed after DENIED (approved violation re-entry) - Locking gate, returning to standby")
+                    
+                    # Get RFID from approved violation info
+                    cancel_rfid = self.approved_violation_rfid
+                    
+                    # CRITICAL: Delete the entry record that was just created
+                    # Since guard cancelled, student didn't actually enter, so next tap should be ENTRY not EXIT
+                    if cancel_rfid:
+                        try:
+                            self.delete_most_recent_entry_record(cancel_rfid)
+                            print(f"✅ Deleted entry record for RFID {cancel_rfid} - next tap will be treated as ENTRY")
+                        except Exception as e:
+                            print(f"⚠️ WARNING: Could not delete entry record: {e}")
+                    
+                    # Send deny command to Arduino (lock gate quickly)
+                    self.send_arduino_command("DENY")
+                    
+                    # Update gate status
+                    self.gate_status_label.config(text="🔒 Gate: Locked", fg='#dc2626')
+                    
+                    # Reset GRANTED button back to DENIED
+                    if hasattr(self, 'deny_button') and self.deny_button:
+                        try:
+                            self.deny_button.config(
+                                text="DENIED",
+                                command=self.handle_interface_deny,
+                                state=tk.DISABLED
+                            )
+                            print(f"✅ GRANTED button reset to DENIED (approved violation re-entry cancelled)")
+                        except Exception as e:
+                            print(f"⚠️ WARNING: Could not reset GRANTED button: {e}")
+                    
+                    # Disable all buttons
+                    if hasattr(self, 'approve_button') and self.approve_button:
+                        self.approve_button.config(state=tk.DISABLED)
+                    if hasattr(self, 'cancel_button') and self.cancel_button:
+                        self.cancel_button.config(state=tk.DISABLED)
+                    
+                    # Reset denied button state flags
+                    self.denied_button_clicked = False
+                    self.original_detection_state = None
+                    self.original_uniform_status = None
+                    
+                    # Clear approved violation info
+                    self.approved_violation_student_info = None
+                    self.approved_violation_rfid = None
+                    
+                    # Make checkboxes read-only again
+                    self._make_requirement_checkboxes_editable(False)
+                    
+                    # Hide requirements section
+                    self.hide_requirements_section()
+                    
+                    # Clear main screen and return to standby immediately (no delay)
+                    if hasattr(self, 'person_display_frame'):
+                        for widget in self.person_display_frame.winfo_children():
+                            try:
+                                widget.destroy()
+                            except Exception:
+                                pass
+                    
+                    if self.main_screen_window and self.main_screen_window.winfo_exists():
+                        self.show_standby_message()
+                    
+                    # Show info message
+                    self.show_green_success_message("Gate Locked", 
+                                      "Gate is locked\n"
+                                      "❌ Entry cancelled\n"
+                                      "🔄 Returned to standby")
+                    
+                    return
                 
                 if is_complete_uniform:
                     print("INFO: Cancel button pressed after DENIED (complete uniform) - Permanently locking gate and returning to standby")
@@ -14291,8 +16145,31 @@ class GuardMainControl:
                 messagebox.showerror("Error", "Cannot process cancel - missing student information")
                 return
             
+            # CRITICAL: Reset detection flags BEFORE recording entry
+            # This ensures update_main_screen_with_person shows ENTRY status, not DETECTING
+            # record_complete_uniform_entry calls update_main_screen_with_permanent_student
+            # which calls update_main_screen_with_person, and that function checks detection_active flag
+            try:
+                # Reset detection flags FIRST (before recording entry and updating main screen)
+                self.detection_active = False
+                self.uniform_detection_complete = True  # Mark as complete since approved
+                print(f"✅ Detection flags reset BEFORE recording entry: detection_active=False, uniform_detection_complete=True")
+                
+                # Clear detection session tracking
+                if current_rfid in self.active_detection_sessions:
+                    del self.active_detection_sessions[current_rfid]
+                    print(f"✅ Cleared detection session for RFID {current_rfid}")
+                
+                # Stop any running detection
+                if hasattr(self, 'detection_system') and self.detection_system:
+                    self.detection_system.stop_detection()
+                    print(f"✅ Stopped detection system after cancel approval")
+            except Exception as e:
+                print(f"⚠️ WARNING: Could not reset detection flags: {e}")
+            
             # CRITICAL: Record entry as COMPLETE UNIFORM (no violation)
             # This clears violations and allows entry without violation
+            # This will update the main screen with ENTRY status (flags are already set above)
             self.record_complete_uniform_entry(current_rfid, student_info)
             
             # Open gate (same as complete uniform)
@@ -14308,9 +16185,8 @@ class GuardMainControl:
                               "👤 Student may proceed\n"
                               "✅ Uniform violation overridden")
             
-            # Update main screen
-            if self.main_screen_window and self.main_screen_window.winfo_exists():
-                self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (NO VIOLATION)")
+            # NOTE: record_complete_uniform_entry already updates main screen with entry status
+            # Don't overwrite it with gate status - entry status is more important
             
             # Disable buttons after processing
             if hasattr(self, 'approve_button') and self.approve_button:
@@ -14325,6 +16201,7 @@ class GuardMainControl:
             self.hide_requirements_section()
             
             # Clear main screen after gate control action
+            # This will schedule a 15-second timer to clear the screen (entry status will be visible for 15 seconds)
             self.clear_main_screen_after_gate_action()
             
             # Schedule status update after unlock duration
@@ -14386,7 +16263,7 @@ class GuardMainControl:
                 # Toggle button text from DENIED to GRANTED
                 if hasattr(self, 'deny_button') and self.deny_button:
                     self.deny_button.config(
-                        text="GRANTED\n(Unlock Gate)",
+                        text="GRANTED",
                         command=self.handle_interface_granted_after_deny
                     )
                     print(f"✅ DENIED button toggled to GRANTED")
@@ -14415,11 +16292,27 @@ class GuardMainControl:
                         except Exception as e:
                             print(f"⚠️ Error setting stop event: {e}")
                 
-                # Ensure all buttons are enabled (for complete uniform scenario)
-                if hasattr(self, 'approve_button') and self.approve_button:
-                    self.approve_button.config(state=tk.NORMAL)
-                if hasattr(self, 'cancel_button') and self.cancel_button:
-                    self.cancel_button.config(state=tk.NORMAL)
+                # CRITICAL: Check if this is approved violation re-entry scenario
+                is_approved_violation_scenario = (
+                    hasattr(self, 'approved_violation_student_info') and 
+                    self.approved_violation_student_info is not None
+                )
+                
+                # Enable buttons based on scenario
+                if is_approved_violation_scenario:
+                    # Approved violation re-entry: Enable ACCESS GRANTED and CANCEL
+                    if hasattr(self, 'approve_button') and self.approve_button:
+                        self.approve_button.config(state=tk.NORMAL)
+                        print(f"✅ ACCESS GRANTED button enabled - approved violation re-entry scenario")
+                    if hasattr(self, 'cancel_button') and self.cancel_button:
+                        self.cancel_button.config(state=tk.NORMAL)
+                        print(f"✅ CANCEL button enabled - approved violation re-entry scenario")
+                else:
+                    # Normal scenario: Enable all buttons (for complete uniform scenario)
+                    if hasattr(self, 'approve_button') and self.approve_button:
+                        self.approve_button.config(state=tk.NORMAL)
+                    if hasattr(self, 'cancel_button') and self.cancel_button:
+                        self.cancel_button.config(state=tk.NORMAL)
                 
                 # Send deny command to Arduino (keep gate locked)
                 self.send_arduino_command("DENY")
@@ -14431,7 +16324,12 @@ class GuardMainControl:
                 student_info = None
                 current_rfid = None
                 
-                if hasattr(self, 'current_student_info_for_timer') and self.current_student_info_for_timer:
+                # CRITICAL: Check for approved violation re-entry scenario first
+                if hasattr(self, 'approved_violation_student_info') and self.approved_violation_student_info:
+                    student_info = self.approved_violation_student_info
+                    current_rfid = self.approved_violation_rfid
+                    print(f"✅ Using approved violation student info for HOLD status: {student_info.get('name', 'Unknown')}")
+                elif hasattr(self, 'current_student_info_for_timer') and self.current_student_info_for_timer:
                     student_info = self.current_student_info_for_timer
                     current_rfid = student_info.get('rfid') or student_info.get('id')
                 elif hasattr(self, 'complete_uniform_student_info') and self.complete_uniform_student_info:
@@ -14447,15 +16345,69 @@ class GuardMainControl:
                 if not student_info and current_rfid:
                     student_info = self.get_student_info_by_rfid(current_rfid)
                 
+                # CRITICAL: Ensure Student Number is present (not RFID) for HOLD status display
+                # Use the same logic as incomplete uniform to get student number from Firebase
+                if student_info and current_rfid:
+                    # Ensure student number is fetched and validated from Firebase
+                    student_info = self._ensure_student_number_from_firebase(student_info, current_rfid)
+                    
+                    # Get Student Number - should now be guaranteed from validation above
+                    student_number = (student_info.get('student_id') or 
+                                    student_info.get('student_number') or 
+                                    student_info.get('Student Number'))
+                    
+                    # Validate: Student Number should not be RFID, 'Unknown', None, or empty
+                    is_valid = (student_number and 
+                               student_number != 'Unknown' and 
+                               student_number != 'Student Number Not Found' and
+                               str(student_number).strip() != '' and
+                               str(student_number).strip() != str(current_rfid).strip())
+                    
+                    if not is_valid:
+                        # Last resort: fetch directly from Firebase
+                        print(f"⚠️ Student Number still invalid in HOLD status display, fetching directly from Firebase for RFID: {current_rfid}")
+                        fresh_student_info = self.get_student_info_by_rfid(current_rfid)
+                        if fresh_student_info:
+                            student_number = fresh_student_info.get('student_id') or fresh_student_info.get('student_number')
+                            # Final check: make sure it's valid (not None, not empty, not RFID)
+                            if student_number and str(student_number).strip() != '' and str(student_number).strip() != str(current_rfid).strip():
+                                print(f"✅ Fetched Student Number directly from Firebase for HOLD status: {student_number}")
+                                # Update student_info with the correct Student Number
+                                student_info['student_id'] = student_number
+                                student_info['student_number'] = student_number
+                            else:
+                                print(f"⚠️ WARNING: Fetched Student Number from Firebase is invalid (None, empty, or equals RFID): {student_number}")
+                                student_number = 'Student Number Not Found'
+                        else:
+                            print(f"⚠️ WARNING: Could not fetch Student Number from Firebase for HOLD status")
+                            student_number = 'Student Number Not Found'
+                    else:
+                        print(f"✅ Student Number validated for HOLD status: {student_number}")
+                    
+                    # Strip whitespace from student number if it exists
+                    if student_number and student_number != 'Student Number Not Found':
+                        student_number = str(student_number).strip()
+                else:
+                    student_number = 'Student Number Not Found'
+                
                 # Update main screen with HOLD status (keep student info visible)
                 if student_info and self.main_screen_window and self.main_screen_window.winfo_exists():
                     from datetime import datetime
                     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Strip whitespace from course
+                    course_val = student_info.get('course', 'Unknown Course')
+                    if course_val:
+                        course_val = str(course_val).strip()
+                    
                     person_info = {
-                        'id': current_rfid or student_info.get('student_id', ''),
+                        'id': student_number,  # Use Student Number, not RFID
+                        'student_id': student_number,  # Student Number from Firebase
+                        'student_number': student_number,  # Alternative field name
+                        'rfid': current_rfid,  # Keep RFID for reference (for image loading)
                         'name': student_info.get('name', 'Unknown Student'),
                         'type': 'student',
-                        'course': student_info.get('course', 'Unknown'),
+                        'course': course_val,
                         'gender': student_info.get('gender', 'Unknown'),
                         'timestamp': current_time,
                         'status': 'HOLD',  # Display HOLD status
@@ -14463,7 +16415,7 @@ class GuardMainControl:
                         'guard_id': self.current_guard_id or 'Unknown'
                     }
                     self.update_main_screen_with_person(person_info)
-                    print(f"✅ Main screen updated with HOLD status for {student_info.get('name', 'Unknown')}")
+                    print(f"✅ Main screen updated with HOLD status for {student_info.get('name', 'Unknown')} - Student Number: {student_number}")
                 
                 # Keep requirements section visible (don't hide it)
                 print(f"✅ Requirements section remains visible - waiting for guard decision")
@@ -14493,12 +16445,23 @@ class GuardMainControl:
             print("SUCCESS: GRANTED button pressed (after DENIED) - Processing entry based on original detection")
             self.add_activity_log("GRANTED button pressed (after DENIED) - Processing entry")
             
+            # CRITICAL: Check if this is approved violation re-entry scenario
+            is_approved_violation_scenario = (
+                hasattr(self, 'approved_violation_student_info') and 
+                self.approved_violation_student_info is not None
+            )
+            
             # Get student info
             student_info = None
             current_rfid = None
             
-            # Check for complete uniform scenario first
-            if hasattr(self, 'complete_uniform_student_info') and self.complete_uniform_student_info:
+            # Check for approved violation scenario first
+            if is_approved_violation_scenario:
+                student_info = self.approved_violation_student_info
+                current_rfid = self.approved_violation_rfid
+                print(f"✅ Using approved violation student info for GRANTED: {student_info.get('name', 'Unknown')}")
+            # Check for complete uniform scenario
+            elif hasattr(self, 'complete_uniform_student_info') and self.complete_uniform_student_info:
                 student_info = self.complete_uniform_student_info
                 current_rfid = student_info.get('rfid')
             
@@ -14526,9 +16489,95 @@ class GuardMainControl:
                 messagebox.showerror("Error", "Cannot process granted - missing student information")
                 return
             
-            # GRANTED button (formerly DENIED) always records entry WITHOUT violation
+            # CRITICAL: Reset detection flags BEFORE recording entry
+            # This ensures update_main_screen_with_person shows ENTRY status, not DETECTING
+            # record_complete_uniform_entry calls update_main_screen_with_permanent_student
+            # which calls update_main_screen_with_person, and that function checks detection_active flag
+            try:
+                # Reset detection flags FIRST (before recording entry and updating main screen)
+                self.detection_active = False
+                self.uniform_detection_complete = True  # Mark as complete since granted
+                print(f"✅ Detection flags reset BEFORE recording entry: detection_active=False, uniform_detection_complete=True")
+                
+                # Clear detection session tracking
+                if current_rfid in self.active_detection_sessions:
+                    del self.active_detection_sessions[current_rfid]
+                    print(f"✅ Cleared detection session for RFID {current_rfid}")
+                
+                # Stop any running detection
+                if hasattr(self, 'detection_system') and self.detection_system:
+                    self.detection_system.stop_detection()
+                    print(f"✅ Stopped detection system after granted approval")
+            except Exception as e:
+                print(f"⚠️ WARNING: Could not reset detection flags: {e}")
+            
+            # Handle approved violation re-entry scenario
+            if is_approved_violation_scenario:
+                # Approved violation re-entry: Entry without new violation (violation already stored in Firebase)
+                print(f"✅ GRANTED button clicked - recording entry WITHOUT new violation (approved violation re-entry)")
+                self.add_activity_log("GRANTED button pressed - Entry without new violation (approved violation re-entry)")
+                
+                # Record entry without violation (re-entry, violation already stored)
+                self.record_complete_uniform_entry(current_rfid, student_info)
+                
+                # Open gate
+                self.open_gate()
+                
+                # Update gate status
+                self.gate_status_label.config(text="🔓 Gate: Unlocked", fg='#10b981')
+                
+                # Show success message
+                self.show_green_success_message("Entry Approved (No New Violation)", 
+                                  "SUCCESS: Entry recorded WITHOUT new violation\n"
+                                  "🚪 Gate is opening\n"
+                                  "👤 Student may proceed\n"
+                                  "✅ Re-entry allowed (violation already stored)")
+                
+                # Reset GRANTED button back to DENIED
+                if hasattr(self, 'deny_button') and self.deny_button:
+                    try:
+                        self.deny_button.config(
+                            text="DENIED",
+                            command=self.handle_interface_deny,
+                            state=tk.DISABLED
+                        )
+                        print(f"✅ GRANTED button reset to DENIED (approved violation re-entry granted)")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not reset GRANTED button: {e}")
+                
+                # Disable all buttons
+                if hasattr(self, 'approve_button') and self.approve_button:
+                    self.approve_button.config(state=tk.DISABLED)
+                if hasattr(self, 'cancel_button') and self.cancel_button:
+                    self.cancel_button.config(state=tk.DISABLED)
+                
+                # Reset denied button state flags
+                self.denied_button_clicked = False
+                self.original_detection_state = None
+                self.original_uniform_status = None
+                
+                # Clear approved violation info
+                self.approved_violation_student_info = None
+                self.approved_violation_rfid = None
+                
+                # Make checkboxes read-only again
+                self._make_requirement_checkboxes_editable(False)
+                
+                # Hide requirements section
+                self.hide_requirements_section()
+                
+                # Schedule 15-second timer to clear main screen
+                self.clear_main_screen_after_gate_action()
+                
+                # Schedule status update after unlock duration
+                self.root.after(3500, self.update_gate_status_locked)
+                
+                return
+            
+            # Normal scenario: GRANTED button (formerly DENIED) always records entry WITHOUT violation
             # Regardless of original detection state, GRANTED = entry without violation
             print(f"✅ GRANTED button clicked - recording entry WITHOUT violation (bypassing incomplete uniform)")
+            # This will update the main screen with ENTRY status (flags are already set above)
             self.record_complete_uniform_entry(current_rfid, student_info)
             
             # Open gate
@@ -14544,9 +16593,8 @@ class GuardMainControl:
                               "👤 Student may proceed\n"
                               "✅ Uniform violation bypassed")
             
-            # Update main screen
-            if self.main_screen_window and self.main_screen_window.winfo_exists():
-                self.update_main_screen_with_gate_status("UNLOCKED", "APPROVED (NO VIOLATION)")
+            # NOTE: record_complete_uniform_entry already updates main screen with entry status
+            # Don't overwrite it with gate status - entry status is more important
             
             # Cancel auto-entry timer if exists
             if hasattr(self, 'complete_uniform_auto_entry_timer') and self.complete_uniform_auto_entry_timer:
@@ -14569,6 +16617,7 @@ class GuardMainControl:
             self.hide_requirements_section()
             
             # Clear main screen after gate control action
+            # This will schedule a 15-second timer to clear the screen (entry status will be visible for 15 seconds)
             self.clear_main_screen_after_gate_action()
             
             # Schedule status update after unlock duration
@@ -14590,7 +16639,7 @@ class GuardMainControl:
             # Reset DENIED button text and command, but DISABLE it (will be enabled only when new RFID is tapped)
             if hasattr(self, 'deny_button') and self.deny_button:
                 self.deny_button.config(
-                    text="DENIED\n(Keep Locked)",
+                    text="DENIED",
                     command=self.handle_interface_deny,
                     state=tk.DISABLED  # Disabled - will be enabled only when new RFID is tapped
                 )
@@ -15190,6 +17239,21 @@ class GuardMainControl:
                         # Incomplete uniform - show INCOMPLETE UNIFORM
                         status_text = "INCOMPLETE UNIFORM"
                         status_color = '#ef4444'  # Red for incomplete
+                    elif person_info.get('status') == 'TIME-IN':
+                        # TIME-IN status - prioritize showing ENTRY if uniform is complete or detection is not active
+                        # This handles the case when cancel is clicked and entry is recorded
+                        if uniform_complete or not detection_active:
+                            # Entry was recorded (uniform complete or detection stopped) - show ENTRY
+                            status_text = "ENTRY"
+                            status_color = '#10b981'  # Green
+                        elif person_info.get('action') == 'ENTRY' or person_info.get('skip_detection', False):
+                            # Explicit ENTRY action - show ENTRY (not DETECTING)
+                            status_text = "ENTRY"
+                            status_color = '#10b981'  # Green
+                        else:
+                            # Detection still active - show DETECTING
+                            status_text = "DETECTING"
+                            status_color = '#f59e0b'  # Orange/amber
                     elif detection_active and not uniform_complete:
                         # Detection in progress - show DETECTING
                         status_text = "DETECTING"
@@ -15198,16 +17262,6 @@ class GuardMainControl:
                         # Complete uniform - show ENTRY
                         status_text = "ENTRY"
                         status_color = '#10b981'  # Green
-                    elif person_info.get('status') == 'TIME-IN':
-                        # TIME-IN status but no active detection - check if action is explicitly ENTRY
-                        if person_info.get('action') == 'ENTRY' or person_info.get('skip_detection', False):
-                            # Explicit ENTRY action - show ENTRY (not DETECTING)
-                            status_text = "ENTRY"
-                            status_color = '#10b981'  # Green
-                        else:
-                            # No explicit action - treat as detecting (safe fallback)
-                            status_text = "DETECTING"
-                            status_color = '#f59e0b'  # Orange/amber
                     else:
                         # Default based on status
                         if person_info.get('status') == 'TIME-OUT' or person_info.get('status') == 'EXIT':
@@ -15275,7 +17329,7 @@ class GuardMainControl:
                     bg='#ffffff',
                     highlightthickness=0
                 )
-                image_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=30)
+                image_canvas.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
                 
                 # Store original image path for resizing
                 image_canvas.image_path = image_path
@@ -15293,11 +17347,11 @@ class GuardMainControl:
                             # Calculate scaling to fill canvas while maintaining aspect ratio
                             img_width, img_height = original_img.size
                             
-                            # Calculate scale to fit width (making picture shorter/shorter)
+                            # Calculate scale to fill the box with a slight margin
                             scale_x = canvas_width / img_width
                             scale_y = canvas_height / img_height
-                            # Use min to fit within bounds, then reduce to 70% to make it shorter
-                            scale = min(scale_x, scale_y) * 0.7  # Fit within bounds and make smaller
+                            # Use max to fill the box, then shrink by 10% to add a small margin
+                            scale = max(scale_x, scale_y) * 0.90
                             
                             new_width = int(img_width * scale)
                             new_height = int(img_height * scale)
@@ -15556,6 +17610,7 @@ class GuardMainControl:
     def _clear_main_screen_after_delay(self):
         """Clear the main screen person display and return to standby"""
         try:
+            print(f"🔍 _clear_main_screen_after_delay() called - starting clear process")
             # Clear the timer reference
             self.main_screen_clear_timer = None
             
@@ -15572,20 +17627,30 @@ class GuardMainControl:
                 self._schedule_main_screen_clear()
                 return
             
-            # Check if there's a violation pending - if so, don't clear yet
-            # Violation is pending if incomplete_student_info_for_approve is set or if there are active violations
-            has_pending_violation = (
-                hasattr(self, 'incomplete_student_info_for_approve') and 
-                self.incomplete_student_info_for_approve is not None
-            ) or (
-                hasattr(self, 'active_session_violations') and 
-                self.active_session_violations and 
-                any(len(violations) > 0 for violations in self.active_session_violations.values())
+            # CRITICAL: If entry was just saved (detection_active=False, uniform_detection_complete=True),
+            # we should clear regardless of violations - this timer was scheduled specifically for that purpose
+            entry_was_saved = (
+                hasattr(self, 'detection_active') and not self.detection_active and
+                hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete
             )
             
-            if has_pending_violation:
-                print(f"⏸️ Main screen clear skipped - violation pending, waiting for gate control button")
-                return
+            if not entry_was_saved:
+                # Only check for pending violations if entry was NOT saved
+                # Violation is pending if incomplete_student_info_for_approve is set or if there are active violations
+                has_pending_violation = (
+                    hasattr(self, 'incomplete_student_info_for_approve') and 
+                    self.incomplete_student_info_for_approve is not None
+                ) or (
+                    hasattr(self, 'active_session_violations') and 
+                    self.active_session_violations and 
+                    any(len(violations) > 0 for violations in self.active_session_violations.values())
+                )
+                
+                if has_pending_violation:
+                    print(f"⏸️ Main screen clear skipped - violation pending, waiting for gate control button")
+                    return
+            else:
+                print(f"✅ Entry was saved - proceeding with main screen clear (violations already finalized)")
             
             # Clear all widgets from person display frame
             if hasattr(self, 'person_display_frame'):
@@ -15597,6 +17662,28 @@ class GuardMainControl:
             
             # Return to standby mode - show standby message
             self.show_standby_message()
+            
+            # CRITICAL: Disable DENIED button when returning to standby
+            # This ensures buttons are disabled after entry status is displayed and cleared
+            if hasattr(self, 'deny_button') and self.deny_button:
+                try:
+                    self.deny_button.config(state=tk.DISABLED)
+                    print(f"✅ DENIED button disabled - returned to standby")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not disable DENIED button: {e}")
+            
+            # Also ensure APPROVE and CANCEL buttons are disabled
+            if hasattr(self, 'approve_button') and self.approve_button:
+                try:
+                    self.approve_button.config(state=tk.DISABLED)
+                except Exception as e:
+                    pass
+            
+            if hasattr(self, 'cancel_button') and self.cancel_button:
+                try:
+                    self.cancel_button.config(state=tk.DISABLED)
+                except Exception as e:
+                    pass
             
             print(f"✅ Main screen cleared - returned to standby")
             
@@ -16806,3 +18893,4 @@ if __name__ == "__main__":
         except:
             pass
         print("👋 Application closed")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
