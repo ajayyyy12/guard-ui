@@ -608,10 +608,10 @@ class DetectionSystem:
                                 self.main_ui.record_complete_uniform_entry(getattr(self.detection_service, 'current_rfid', None), student_info)
                                 # Show complete uniform popup on main screen
                                 self.main_ui.show_complete_uniform_popup(student_info)
-                        # Stop detection
+                        # Stop detection (but keep display camera running)
                         self.stop_detection()
-                        if hasattr(self, 'main_ui') and self.main_ui:
-                            self.main_ui.initialize_guard_camera_feed()
+                        # Don't call initialize_guard_camera_feed() - it would overwrite display camera feed
+                        # Display camera continues running to show live feed
                         break
                     elif verification_status == "INCOMPLETE":
                         print(f"🎯 BSCPE verification {verification_status} - marking INCOMPLETE (will remain in detection mode)")
@@ -650,19 +650,23 @@ class DetectionSystem:
                 else:
                     print(f"🔍 No BSCPE tracker found - detection_service: {hasattr(self.detection_service, 'bscpe_tracker')}, tracker: {getattr(self.detection_service, 'bscpe_tracker', None)}")
                 
-                # Update UI with clean frame
-                if self.ui_callback and annotated_frame is not None:
-                    self.ui_callback(annotated_frame)
+                # Detection camera does NOT display video - only updates checkboxes
+                # Display camera handles video feed separately
+                # Removed: self.ui_callback(annotated_frame) - detection camera doesn't display video
                 
                 # Also update detected classes list in the UI if available.
                 # Only update when this frame was actually processed (not skipped)
                 # and when we have at least one detection to show.
+                # CRITICAL: Continue updating even after complete uniform is detected
+                # (detection continues in background until entry is recorded)
                 try:
                     if (
                         hasattr(self, 'main_ui') and self.main_ui and 
                         hasattr(self.main_ui, 'update_detected_classes_list')
                     ):
                         if not detection_result.get('skipped') and detected_classes:
+                            # Continue updating detected classes - _update_requirements_status will
+                            # return early if uniform_detection_complete is True, so requirements won't be updated again
                             self.main_ui.update_detected_classes_list(detected_classes)
                 except Exception:
                     pass
@@ -955,6 +959,7 @@ class GuardMainControl:
         self.uniform_detection_timer_duration = 15.0  # 15 second duration
         self.uniform_detection_complete = False  # Flag for early completion
         self.uniform_detection_timer_thread = None  # Background timer thread
+        self.external_detection_stream_thread = None  # Detection stream thread for tracking
         self.current_student_info_for_timer = None  # Store student_info for timer callback
         self.current_rfid_for_timer = None  # Store RFID separately to ensure it's always available
         self.requirements_hide_scheduled = False  # Flag to track if hide is already scheduled
@@ -1889,6 +1894,12 @@ class GuardMainControl:
             if hasattr(self, 'detection_active') and self.detection_active:
                 self.stop_detection()
             
+            # Stop display camera
+            try:
+                self.stop_display_camera()
+            except Exception as e:
+                print(f"⚠️ Error stopping display camera during logout: {e}")
+            
             # Reset camera to standby
             if hasattr(self, 'reset_camera_to_standby'):
                 self.reset_camera_to_standby()
@@ -1951,7 +1962,7 @@ class GuardMainControl:
 # Camera method removed - will be replaced with user's detection file
 
     def update_camera_feed(self, frame):
-        """Update camera feed with detection frame"""
+        """Update camera feed with video frame - used by display camera"""
         try:
             if hasattr(self, 'camera_label') and self.camera_label and self.root.winfo_exists():
                 # Get the camera label dimensions
@@ -2098,6 +2109,29 @@ class GuardMainControl:
             import traceback
             traceback.print_exc()
 
+    def _update_camera_label_with_placeholder(self, placeholder_text):
+        """Update camera label with placeholder message in main thread"""
+        try:
+            if hasattr(self, 'camera_label') and self.camera_label:
+                # Clear any existing image reference
+                if hasattr(self.camera_label, 'image'):
+                    self.camera_label.image = None
+                # Update label with placeholder text, matching standby mode style
+                self.camera_label.config(
+                    text=placeholder_text,
+                    image="",  # Clear image
+                    font=('Arial', 12),
+                    fg='#374151',
+                    bg='#dbeafe',
+                    justify=tk.CENTER,
+                    relief='sunken',
+                    bd=3
+                )
+        except Exception as e:
+            print(f"ERROR: Failed to update camera label with placeholder: {e}")
+            import traceback
+            traceback.print_exc()
+
     def start_person_detection_integrated(self, person_id, person_name, person_type):
         """Start detection for a person using the integrated detection system.
         To avoid freezing the UI when an RFID tap occurs, run the detection
@@ -2109,6 +2143,7 @@ class GuardMainControl:
             try:
                 print(f"🔍 Starting integrated detection for {person_name} ({person_type})")
                 self.add_activity_log(f"🔍 Starting integrated detection for {person_name} ({person_type})")
+                self.add_camera_activity_log(f"HOLD: {person_name} - Detection in progress")
 
                 # Get the correct model path for this person BEFORE initializing DetectionSystem
                 model_path = self._get_model_path_for_person(person_id, person_type)
@@ -2226,7 +2261,7 @@ class GuardMainControl:
                         pass
 
                     success = self.detection_system.start_detection(
-                        person_id, person_name, person_type, ui_callback=self.update_camera_feed
+                        person_id, person_name, person_type, ui_callback=None
                     )
                 except Exception as e:
                     print(f"⚠️ start_detection raised: {e}")
@@ -2345,7 +2380,7 @@ class GuardMainControl:
             # Start detection with UI callback
             success = self.detection_system.start_detection(
                 person_id, person_name, person_type, 
-                ui_callback=self.update_camera_feed
+                ui_callback=None
             )
             
             if success:
@@ -2504,21 +2539,10 @@ class GuardMainControl:
             # if not self.requirements_hide_scheduled:
             #     self.hide_requirements_section()
 
-            # Update the UI label to show that preview is disabled (external window is used)
-            if hasattr(self, 'camera_label') and self.camera_label:
-                standby_text = (
-                    "📷 CAMERA PREVIEW DISABLED\n\n"
-                    "Detection runs in the external Camera Detection window.\n"
-                    "Tap a student RFID to start detection.\n\n"
-                    "Press 'q' in the detection window to close it."
-                )
-                try:
-                    self.camera_label.config(text=standby_text, bg='#dbeafe', fg='#374151')
-                    self.camera_label.pack(expand=True, fill=tk.BOTH, padx=20, pady=20)
-                except Exception:
-                    pass
-            print("✅ UI set to standby (no in-UI camera)")
-            self.add_activity_log("✅ UI set to standby (no in-UI camera)")
+            # Don't overwrite display camera feed - it should continue showing live video
+            # Display camera is managed separately and should keep running
+            print("✅ Detection stopped - display camera continues running")
+            self.add_activity_log("✅ Detection stopped - display camera continues running")
         except Exception as e:
             print(f"❌ Error setting UI standby: {e}")
 
@@ -2591,7 +2615,7 @@ class GuardMainControl:
                 print("✅ DetectionSystem initialized for live feed")
             
             # Start live camera feed (without specific person detection)
-            success = self.detection_system.start_live_feed(ui_callback=self.update_camera_feed)
+            success = self.detection_system.start_live_feed(ui_callback=None)
             if success:
                 print("✅ Live camera feed started")
                 self.add_activity_log("✅ Live camera feed started")
@@ -2741,6 +2765,137 @@ class GuardMainControl:
         except Exception as e:
             print(f"❌ Guard camera feed failed: {e}")
             self.add_activity_log(f"❌ Guard camera feed failed: {e}")
+
+    def start_display_camera(self):
+        """Start display camera for LIVE CAMERA FEED panel (no detection, just display)"""
+        try:
+            print("📹 Starting display camera for LIVE CAMERA FEED...")
+            self.add_activity_log("📹 Starting display camera...")
+            
+            # Stop any existing display camera first
+            self.stop_display_camera()
+            
+            import cv2
+            import threading
+            
+            def display_camera_loop():
+                cap = None
+                try:
+                    self.display_camera_active = True
+                    camera_index = 0  # Use same physical camera as detection
+                    
+                    # Open camera with separate VideoCapture instance
+                    try:
+                        if platform.system().lower().startswith('win') and hasattr(cv2, 'CAP_DSHOW'):
+                            cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+                        else:
+                            cap = cv2.VideoCapture(camera_index)
+                        # Reduce buffer size for responsive display
+                        try:
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"⚠️ Failed to open display camera with DirectShow: {e}")
+                        try:
+                            cap = cv2.VideoCapture(camera_index)
+                        except Exception:
+                            cap = None
+                    
+                    if not cap or not cap.isOpened():
+                        print("❌ Display camera failed to open")
+                        # Show error message in camera feed
+                        if hasattr(self, 'camera_label') and self.camera_label:
+                            error_text = "❌ Camera Error\n\nFailed to open camera for display.\n\nPlease check camera connection."
+                            self.root.after(0, self._update_camera_label_with_placeholder, error_text)
+                        return
+                    
+                    self.display_camera_cap = cap
+                    print(f"✅ Display camera opened (index {camera_index})")
+                    
+                    frame_count = 0
+                    while getattr(self, 'display_camera_active', True):
+                        ret, frame = False, None
+                        try:
+                            ret, frame = cap.read()
+                        except Exception:
+                            ret = False
+                        
+                        if not ret or frame is None:
+                            time.sleep(0.03)
+                            continue
+                        
+                        frame_count += 1
+                        
+                        # Update LIVE CAMERA FEED panel with video frame
+                        try:
+                            self.update_camera_feed(frame)
+                        except Exception as e:
+                            print(f"⚠️ Error updating display camera feed: {e}")
+                        
+                        # Debug: Print every 60 frames
+                        if frame_count % 60 == 0:
+                            try:
+                                print(f"📹 Display camera frame {frame_count}")
+                            except Exception:
+                                pass
+                        
+                        time.sleep(0.033)  # ~30 FPS
+                
+                except Exception as e:
+                    print(f"❌ Display camera error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    try:
+                        if cap is not None:
+                            cap.release()
+                            print("🛑 Display camera released")
+                    except Exception:
+                        pass
+                    try:
+                        self.display_camera_cap = None
+                        self.display_camera_active = False
+                    except Exception:
+                        pass
+                    print("🛑 Display camera loop ended")
+            
+            # Start display camera in separate thread
+            self.display_camera_thread = threading.Thread(target=display_camera_loop, daemon=True)
+            self.display_camera_thread.start()
+            print("✅ Display camera started")
+            
+        except Exception as e:
+            print(f"❌ Error starting display camera: {e}")
+            self.add_activity_log(f"❌ Error starting display camera: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def stop_display_camera(self):
+        """Stop display camera and release resources"""
+        try:
+            if hasattr(self, 'display_camera_active') and self.display_camera_active:
+                print("🛑 Stopping display camera...")
+                self.display_camera_active = False
+                
+                # Wait a bit for thread to finish
+                if hasattr(self, 'display_camera_thread') and self.display_camera_thread:
+                    try:
+                        self.display_camera_thread.join(timeout=2.0)
+                    except Exception:
+                        pass
+                
+                # Release camera
+                if hasattr(self, 'display_camera_cap') and self.display_camera_cap:
+                    try:
+                        self.display_camera_cap.release()
+                    except Exception:
+                        pass
+                    self.display_camera_cap = None
+                
+                print("✅ Display camera stopped")
+        except Exception as e:
+            print(f"⚠️ Error stopping display camera: {e}")
 
     def start_fallback_camera_feed(self):
         """Fallback camera feed when main detection system fails"""
@@ -2906,7 +3061,7 @@ class GuardMainControl:
                 pass
 
             # Start detection with BSBA model
-            success = self.detection_system.start_detection(rfid, person_name, "student", ui_callback=self.update_camera_feed)
+            success = self.detection_system.start_detection(rfid, person_name, "student", ui_callback=None)
             
             if success:
                 print(f"✅ BSBA {gender} detection started for {person_name}")
@@ -2941,7 +3096,7 @@ class GuardMainControl:
                     pass
 
                 # Start detection with appropriate model
-                self.detection_system.start_detection(rfid, person_name, "student", ui_callback=self.update_camera_feed)
+                self.detection_system.start_detection(rfid, person_name, "student", ui_callback=None)
                 print(f"✅ Switched to {course} {gender} detection for {person_name}")
                 self.add_activity_log(f"✅ Switched to {course} {gender} detection for {person_name}")
             else:
@@ -3052,7 +3207,7 @@ class GuardMainControl:
                     except Exception:
                         pass
 
-                    success = self.detection_system.start_detection(rfid, person_name, "student", ui_callback=self.update_camera_feed)
+                    success = self.detection_system.start_detection(rfid, person_name, "student", ui_callback=None)
                 except Exception as e:
                     print(f"⚠️ start_detection exception: {e}")
                     success = False
@@ -3096,6 +3251,12 @@ class GuardMainControl:
             # Update guard name display after dashboard is created
             if hasattr(self, 'current_guard_id') and self.current_guard_id:
                 self.update_guard_name_display(self.current_guard_id)
+            
+            # Start display camera for LIVE CAMERA FEED panel
+            try:
+                self.start_display_camera()
+            except Exception as e:
+                print(f"⚠️ Error starting display camera: {e}")
             
             # Switch to dashboard tab
             print("🔍 Switching to dashboard tab...")
@@ -3505,10 +3666,17 @@ class GuardMainControl:
         )
         name_label.pack(pady=(0, 10))
         
-        # ID
+        # ID - For students, prefer student_id or student_number over id (which might be RFID)
+        if person_data.get('type') == 'student':
+            # Use student_id or student_number if available, otherwise fall back to id
+            student_id = person_data.get('student_id') or person_data.get('student_number') or person_data.get('id', 'Unknown')
+            id_text = f"ID: {student_id}"
+        else:
+            id_text = f"ID: {person_data.get('id', 'Unknown')}"
+        
         id_label = tk.Label(
             details_frame,
-            text=f"ID: {person_data.get('id', 'Unknown')}",
+            text=id_text,
             font=('Arial', 18, 'bold'),
             fg='#374151',
             bg='#ffffff'
@@ -3643,9 +3811,15 @@ class GuardMainControl:
             SUPPRESSION_WINDOW = 1.0 if not is_event_mode else 0.0  # seconds
             now = datetime.now()
 
-            # For Event Mode, always show entries (skip duplicate checks)
-            if is_event_mode:
-                print(f"✅ Event Mode entry - skipping duplicate suppression")
+            # Check if this entry should bypass duplicate suppression (e.g., complete uniform entry)
+            force_show = person_data.get('force_show', False)
+            
+            # For Event Mode or forced entries, always show entries (skip duplicate checks)
+            if is_event_mode or force_show:
+                if force_show:
+                    print(f"✅ Force show entry - skipping duplicate suppression (complete uniform entry)")
+                else:
+                    print(f"✅ Event Mode entry - skipping duplicate suppression")
             else:
                 # If duplicate of most recent global entry, skip inserting (only for normal mode)
                 if last_key == key:
@@ -3666,41 +3840,117 @@ class GuardMainControl:
             entry_text = f"[{timestamp}] {name} ({person_type.upper()}) - {action}"
             print(f"🔍 DEBUG: Entry text = '{entry_text}'")
 
-            # Check if listbox exists
-            if not hasattr(self, 'recent_entries_listbox') or not self.recent_entries_listbox:
-                print(f"❌ ERROR: recent_entries_listbox not found!")
-                return
-
-            # Insert at the beginning
+            # Ensure main screen is open before trying to add entry
+            # Note: We'll check and open it in the insert_entry function to avoid blocking
+            main_screen_needs_opening = False
             try:
-                self.recent_entries_listbox.insert(0, entry_text)
-                print(f"✅ Entry inserted into listbox at index 0")
+                if not hasattr(self, 'main_screen_window') or self.main_screen_window is None or not self.main_screen_window.winfo_exists():
+                    print(f"⚠️ Main screen window not open, will open it before adding entry...")
+                    main_screen_needs_opening = True
             except Exception as e:
-                print(f"❌ ERROR: Failed to insert into listbox: {e}")
+                print(f"⚠️ Warning: Could not check main screen window: {e}")
+
+            # Check if listbox exists
+            listbox_available = hasattr(self, 'recent_entries_listbox') and self.recent_entries_listbox is not None
+            if not listbox_available:
+                print(f"⚠️ recent_entries_listbox not found! Has attr: {hasattr(self, 'recent_entries_listbox')}")
+                if hasattr(self, 'recent_entries_listbox'):
+                    print(f"   recent_entries_listbox value: {self.recent_entries_listbox}")
+                main_screen_needs_opening = True
+
+            # Insert at the beginning (ensure UI update happens in main thread)
+            def insert_entry():
+                try:
+                    # Ensure main screen is open first
+                    if main_screen_needs_opening:
+                        try:
+                            print(f"🔧 Opening main screen before inserting entry...")
+                            self.open_main_screen()
+                            # Small delay to allow window to initialize (using after instead of sleep)
+                            if hasattr(self, 'root') and self.root:
+                                # Schedule retry after window initializes
+                                self.root.after(100, insert_entry)
+                                return
+                            else:
+                                # Fallback: use a small sleep if root not available
+                                import time
+                                time.sleep(0.2)
+                        except Exception as e:
+                            print(f"⚠️ Warning: Could not open main screen: {e}")
+                    
+                    # Check if listbox exists now
+                    if not hasattr(self, 'recent_entries_listbox') or not self.recent_entries_listbox:
+                        print(f"❌ ERROR: recent_entries_listbox still not found!")
+                        return
+                    
+                    # Check if listbox widget still exists
+                    try:
+                        if not self.recent_entries_listbox.winfo_exists():
+                            print(f"❌ ERROR: recent_entries_listbox widget no longer exists!")
+                            return
+                    except Exception as e:
+                        print(f"❌ ERROR: Could not check if listbox exists: {e}")
+                        return
+                    
+                    # Now insert the entry
+                    if hasattr(self, 'recent_entries_listbox') and self.recent_entries_listbox:
+                        self.recent_entries_listbox.insert(0, entry_text)
+                        print(f"✅ Entry inserted into listbox at index 0: {entry_text}")
+                        
+                        # Track the key after successful insertion
+                        try:
+                            if not hasattr(self, 'recent_entries_keys'):
+                                from collections import deque
+                                self.recent_entries_keys = deque(maxlen=20)
+                            self.recent_entries_keys.appendleft(key)
+                            print(f"✅ Key tracked: {key}")
+                        except Exception as e:
+                            print(f"⚠️ Warning: Could not track key: {e}")
+
+                        # Update per-person last action
+                        try:
+                            if not hasattr(self, 'last_logged_action'):
+                                self.last_logged_action = {}
+                            self.last_logged_action[canonical_id] = (str(action).upper(), now)
+                            print(f"✅ Last action updated for {canonical_id}: {action} at {now}")
+                        except Exception as e:
+                            print(f"⚠️ Warning: Could not update last action: {e}")
+                        
+                        # Keep only last 20 entries in UI listbox
+                        try:
+                            if self.recent_entries_listbox.size() > 20:
+                                self.recent_entries_listbox.delete(20, tk.END)
+                        except Exception as e:
+                            print(f"⚠️ Warning: Could not trim listbox: {e}")
+                    else:
+                        print(f"❌ ERROR: recent_entries_listbox not available for insertion")
+                except Exception as e:
+                    print(f"❌ ERROR: Failed to insert into listbox: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Schedule UI update in main thread
+            try:
+                if hasattr(self, 'root') and self.root:
+                    # Use after(0) to schedule in main thread immediately
+                    self.root.after(0, insert_entry)
+                    print(f"✅ Scheduled entry insertion in main thread")
+                else:
+                    print(f"⚠️ Root not available, trying direct insertion")
+                    # Fallback: try direct insertion if root not available
+                    insert_entry()
+            except Exception as e:
+                print(f"⚠️ Warning: Could not schedule UI update: {e}")
                 import traceback
                 traceback.print_exc()
-                return
+                # Fallback: try direct insertion
+                try:
+                    insert_entry()
+                except Exception as e2:
+                    print(f"❌ ERROR: Direct insertion also failed: {e2}")
 
-            # Track the key
-            try:
-                self.recent_entries_keys.appendleft(key)
-                print(f"✅ Key tracked: {key}")
-            except Exception as e:
-                print(f"⚠️ Warning: Could not track key: {e}")
-
-            # Update per-person last action
-            try:
-                self.last_logged_action[canonical_id] = (str(action).upper(), now)
-                print(f"✅ Last action updated for {canonical_id}: {action} at {now}")
-            except Exception as e:
-                print(f"⚠️ Warning: Could not update last action: {e}")
-
-            # Keep only last 20 entries in UI listbox
-            try:
-                if self.recent_entries_listbox.size() > 20:
-                    self.recent_entries_listbox.delete(20, tk.END)
-            except Exception as e:
-                print(f"⚠️ Warning: Could not trim listbox: {e}")
+            # Keep only last 20 entries in UI listbox (done inside insert_entry after insertion)
+            # Note: Trimming is handled inside insert_entry function after successful insertion
 
             # Force UI update
             try:
@@ -3780,7 +4030,7 @@ class GuardMainControl:
                 hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete
             )
             if not entry_was_saved:
-                # Schedule clearing main screen after 15 seconds (only if entry was NOT just saved)
+                # Schedule clearing main screen after 10 seconds (only if entry was NOT just saved)
                 self._schedule_main_screen_clear()
             else:
                 print(f"⏸️ Skipping _schedule_main_screen_clear - entry was just saved, timer already scheduled")
@@ -3853,7 +4103,7 @@ class GuardMainControl:
             # Update main screen immediately
             self.display_person_info(person_data)
             
-            # Schedule clearing main screen after 15 seconds
+            # Schedule clearing main screen after 10 seconds
             self._schedule_main_screen_clear()
             
             print(f"SUCCESS: Main screen updated with {person_type}: {person_name} ({person_id})")
@@ -3897,7 +4147,7 @@ class GuardMainControl:
             # Update main screen with exit information
             self.display_person_info(person_data)
             
-            # Schedule clearing main screen after 15 seconds
+            # Schedule clearing main screen after 10 seconds
             self._schedule_main_screen_clear()
             
             print(f"SUCCESS: Main screen updated with {person_type} exit: {person_name} ({person_id})")
@@ -8985,6 +9235,7 @@ class GuardMainControl:
             
             # Log activity
             self.add_activity_log(f"Visitor Time-In: {visitor_info['name']} (RFID: {rfid}) - {current_time}")
+            self.add_camera_activity_log(f"ENTRY: {visitor_info['name']} (Visitor)")
             
             # Save to Firebase
             self.save_visitor_activity_to_firebase(rfid, 'time_in', current_time)
@@ -9067,6 +9318,7 @@ class GuardMainControl:
             
             # Log activity
             self.add_activity_log(f"Visitor Time-Out: {visitor_info['name']} (RFID: {rfid}) - {current_time} - Duration: {duration}")
+            self.add_camera_activity_log(f"EXIT: {visitor_info['name']} (Visitor)")
             
             # Save to Firebase
             self.save_visitor_activity_to_firebase(rfid, 'time_out', current_time, duration=str(duration))
@@ -9255,6 +9507,7 @@ class GuardMainControl:
             
             # Log activity
             self.add_activity_log(f"entry(teacher) - {teacher_info.get('name', 'Unknown Teacher')}")
+            self.add_camera_activity_log(f"ENTRY: {teacher_info.get('name', 'Unknown Teacher')} (Teacher)")
             
             # Save to Firebase
             self.save_teacher_activity_to_firebase(rfid, 'time_in', current_time, teacher_info)
@@ -9303,6 +9556,7 @@ class GuardMainControl:
             
             # Log activity
             self.add_activity_log(f"exit(teacher) - {teacher_info.get('name', 'Unknown Teacher')}")
+            self.add_camera_activity_log(f"EXIT: {teacher_info.get('name', 'Unknown Teacher')} (Teacher)")
             
             # Save to Firebase
             self.save_teacher_activity_to_firebase(rfid, 'time_out', current_time, teacher_info)
@@ -10687,6 +10941,7 @@ class GuardMainControl:
                         # This prevents detection from starting again after entry is saved
                         print(f"🎯 Student {student_info.get('name', 'Unknown')} is inside - processing EXIT")
                         print(f"   Entry record found - treating as EXIT (no detection retry allowed)")
+                        print(f"   Cache timestamp: {self.recent_entry_cache.get(rfid, 'N/A') if hasattr(self, 'recent_entry_cache') else 'N/A'}")
                         
                         # CRITICAL: Stop any running detection before processing exit
                         try:
@@ -10697,6 +10952,13 @@ class GuardMainControl:
                             self.uniform_detection_complete = False
                         except Exception as e:
                             print(f"⚠️ Warning: Could not stop detection before EXIT: {e}")
+                        
+                        # Hide requirements section before processing exit
+                        try:
+                            self.hide_requirements_section()
+                            print("✅ Requirements section hidden before EXIT")
+                        except Exception as e:
+                            print(f"⚠️ Error hiding requirements section before EXIT: {e}")
                         
                         self.handle_permanent_student_timeout(rfid, student_info)
                         return  # Exit early - don't start detection
@@ -11151,6 +11413,30 @@ class GuardMainControl:
                               f"🎉 Entry recorded successfully!\n\n"
                               f"Student is now inside the school.")
             
+            # CRITICAL: When complete uniform is detected, only DENIED button should be enabled
+            # ACCESS GRANTED and CANCEL buttons should remain disabled
+            if hasattr(self, 'approve_button') and self.approve_button:
+                try:
+                    self.approve_button.config(state=tk.DISABLED)
+                    print(f"❌ ACCESS GRANTED button disabled - complete uniform detected, only DENIED enabled")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not disable ACCESS GRANTED button: {e}")
+            
+            if hasattr(self, 'cancel_button') and self.cancel_button:
+                try:
+                    self.cancel_button.config(state=tk.DISABLED)
+                    print(f"❌ CANCEL button disabled - complete uniform detected, only DENIED enabled")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not disable CANCEL button: {e}")
+            
+            # Keep DENIED button enabled (guard can still deny if needed)
+            if hasattr(self, 'deny_button') and self.deny_button:
+                try:
+                    self.deny_button.config(state=tk.NORMAL)
+                    print(f"✅ DENIED button enabled - complete uniform detected")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+            
             # Update main screen with complete uniform status
             if self.main_screen_window and self.main_screen_window.winfo_exists():
                 # You can add specific UI updates here if needed
@@ -11190,8 +11476,12 @@ class GuardMainControl:
             # Log activity
             if event_mode:
                 self.add_activity_log(f"Student Entry (Complete Uniform - Event Mode): {student_info['name']} (RFID: {rfid}) - {current_time}")
+                self.add_camera_activity_log(f"ENTRY: {student_info['name']} (Event Mode)")
             else:
                 self.add_activity_log(f"Student Entry (Complete Uniform): {student_info['name']} (RFID: {rfid}) - {current_time}")
+                self.add_camera_activity_log(f"ENTRY: {student_info['name']}")
+                # Add complete uniform detection to activity log
+                self.add_camera_activity_log(f"✅ Complete Uniform Detected: {student_info['name']}")
             
             # Clear pending violations when student passes (they succeeded, violations don't count)
             if rfid and rfid in self.active_session_violations:
@@ -11217,6 +11507,25 @@ class GuardMainControl:
             # Save to Firebase (with event_mode flag)
             self.save_permanent_student_activity_to_firebase(rfid, 'time_in', current_time, student_info, event_mode=event_mode)
             
+            # CRITICAL: Stop detection processing but keep camera feed running
+            try:
+                # Stop detection processing (set flags to stop uniform checking)
+                self.detection_active = False
+                # CRITICAL: Keep uniform_detection_complete = True to indicate entry was saved
+                # This flag is used by _clear_main_screen_after_delay to know entry was saved
+                # DO NOT set to False - we need it True for the clear timer to work
+                if not hasattr(self, 'uniform_detection_complete') or not self.uniform_detection_complete:
+                    self.uniform_detection_complete = True
+                    print(f"✅ Set uniform_detection_complete = True for clear timer")
+                
+                # CRITICAL: Do NOT stop the camera stream - keep it running
+                # Do NOT set external_detection_stop_event - this would stop the camera
+                # Do NOT call detection_system.stop_detection() - this would close the camera
+                # The camera feed should continue showing, but uniform detection processing is stopped
+                print("✅ Detection processing stopped - camera feed continues running")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not stop detection processing: {e}")
+            
             # CRITICAL: Add to local cache immediately to prevent race condition
             # This ensures that if RFID is tapped again before Firebase query completes, we know entry exists
             import time
@@ -11225,9 +11534,60 @@ class GuardMainControl:
             self.recent_entry_cache[rfid] = time.time()
             print(f"✅ Added RFID {rfid} to recent entry cache (timestamp: {self.recent_entry_cache[rfid]})")
             
-            # Update main screen
+            # DO NOT add entry to activity log here - entries should only be logged when explicitly needed
+            # Activity log entries are handled separately and should not show "ENTRY" status
+            # The main screen will show the entry status, but it shouldn't appear in the activity log
+            
+            # Update main screen first
             if self.main_screen_window and self.main_screen_window.winfo_exists():
                 self.update_main_screen_with_permanent_student(student_info, 'time_in', current_time, rfid=rfid)
+            
+            # CRITICAL: Schedule main screen clear timer after entry is recorded
+            # This ensures the student information disappears after 10 seconds
+            # Clear any existing timer first to avoid conflicts
+            try:
+                if hasattr(self, 'main_screen_clear_timer') and self.main_screen_clear_timer is not None:
+                    try:
+                        self.root.after_cancel(self.main_screen_clear_timer)
+                        print(f"🔍 Cancelled existing main screen clear timer")
+                    except Exception:
+                        pass
+                    self.main_screen_clear_timer = None
+                
+                # Schedule new timer to clear main screen after 10 seconds
+                # Use a lambda to ensure the function is called correctly
+                def clear_main_screen():
+                    print(f"⏰ Timer fired - clearing main screen after 10 seconds")
+                    self._clear_main_screen_after_delay()
+                
+                self.main_screen_clear_timer = self.root.after(10000, clear_main_screen)
+                print(f"✅ Scheduled main screen clear after 10 seconds (entry recorded) - timer ID: {self.main_screen_clear_timer}")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not schedule main screen clear timer: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Hide requirements section immediately after complete uniform is detected
+            # uniform_detection_complete is already True (set in _handle_complete_uniform_detected)
+            # This flag prevents requirements from updating and indicates entry was saved
+            
+            def hide_requirements_after_update():
+                try:
+                    # Force hide requirements section
+                    if hasattr(self, 'requirements_frame') and self.requirements_frame:
+                        self.requirements_frame.pack_forget()
+                        print("✅ Requirements section hidden immediately after complete uniform")
+                    # Show spacer again
+                    if hasattr(self, 'requirements_spacer') and self.requirements_spacer:
+                        try:
+                            self.requirements_spacer.pack(fill=tk.X)
+                        except:
+                            pass
+                except Exception as e:
+                    print(f"⚠️ Error hiding requirements section: {e}")
+            
+            # Schedule hide after a short delay to ensure main screen update completes first
+            self.root.after(200, hide_requirements_after_update)
             
             # Show success message
             self.show_green_success_message("Entry Recorded", 
@@ -11633,6 +11993,55 @@ class GuardMainControl:
                 except Exception as e:
                     print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
             
+            # CRITICAL: Final safety check - verify entry record doesn't exist before starting detection
+            # This prevents detection from starting if entry record was missed in earlier checks
+            import time
+            final_entry_check = False
+            if hasattr(self, 'recent_entry_cache') and rfid in self.recent_entry_cache:
+                cache_timestamp = self.recent_entry_cache[rfid]
+                if time.time() - cache_timestamp < 300:
+                    final_entry_check = True
+                    print(f"🛑 FINAL CHECK: Entry record found in cache - ABORTING detection start")
+            
+            if not final_entry_check:
+                final_entry_check = self.check_student_has_entry_record(rfid)
+                if final_entry_check:
+                    print(f"🛑 FINAL CHECK: Entry record found in Firebase - ABORTING detection start")
+                    # Add to cache
+                    if not hasattr(self, 'recent_entry_cache'):
+                        self.recent_entry_cache = {}
+                    self.recent_entry_cache[rfid] = time.time()
+            
+            if final_entry_check:
+                print(f"🛑 CRITICAL: Entry record exists - processing as EXIT instead of starting detection")
+                print(f"   RFID: {rfid}")
+                print(f"   Student: {student_info.get('name', 'Unknown')}")
+                print(f"   Cache timestamp: {self.recent_entry_cache.get(rfid, 'N/A') if hasattr(self, 'recent_entry_cache') else 'N/A'}")
+                
+                # Stop any running detection immediately
+                try:
+                    if hasattr(self, 'detection_system') and self.detection_system:
+                        self.detection_system.stop_detection()
+                        print("🛑 Stopped detection system in final check")
+                    self.detection_active = False
+                    self.uniform_detection_complete = False
+                    print("🛑 Set detection flags to False")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not stop detection: {e}")
+                
+                # Hide requirements section
+                try:
+                    self.hide_requirements_section()
+                    print("✅ Requirements section hidden in final check")
+                except Exception as e:
+                    print(f"⚠️ Error hiding requirements section: {e}")
+                
+                # Process as EXIT
+                print(f"🔄 Calling handle_permanent_student_timeout for EXIT...")
+                self.handle_permanent_student_timeout(rfid, student_info)
+                print(f"✅ EXIT processed successfully - detection prevented")
+                return  # Exit early - don't start detection
+            
             # Make checkboxes read-only when detection starts
             self._make_requirement_checkboxes_editable(False)
             
@@ -11920,16 +12329,35 @@ class GuardMainControl:
             # Stop guard preview to free the camera before starting external detection
             try:
                 self.stop_guard_camera_feed()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ Error stopping guard camera feed: {e}")
 
-            # Stop any ongoing external stream
+            # Stop any ongoing external stream and wait for it to finish
             try:
                 if hasattr(self, 'external_detection_stop_event') and self.external_detection_stop_event:
+                    # Set stop event to signal the stream to stop
                     self.external_detection_stop_event.set()
-                    time.sleep(0.05)
-            except Exception:
-                pass
+                    print("🛑 Stopping previous detection stream...")
+                    
+                    # Wait for the detection stream thread to finish (if it exists)
+                    if hasattr(self, 'external_detection_stream_thread') and self.external_detection_stream_thread:
+                        if self.external_detection_stream_thread.is_alive():
+                            # Wait up to 2 seconds for the thread to finish
+                            self.external_detection_stream_thread.join(timeout=2.0)
+                            if self.external_detection_stream_thread.is_alive():
+                                print("⚠️ Warning: Detection stream thread did not finish within timeout")
+                            else:
+                                print("✅ Previous detection stream thread finished")
+                    else:
+                        # Give the stream some time to stop (camera release)
+                        time.sleep(0.5)
+                    
+                    # Additional wait to ensure camera is fully released
+                    time.sleep(0.3)
+            except Exception as e:
+                print(f"⚠️ Error stopping previous detection stream: {e}")
+                # Still wait a bit to ensure camera is released
+                time.sleep(0.5)
 
             # Prepare stop event and start streaming frames into the UI
             self.external_detection_stop_event = threading.Event()
@@ -11938,6 +12366,48 @@ class GuardMainControl:
             self._requirement_detection_counts = {}
             self._permanently_checked_requirements = set()
             self.requirements_hide_scheduled = False  # Reset flag for new detection
+            
+            # CRITICAL: Reset uniform_detection_complete flag for new RFID tap
+            # This allows requirements section to show again for new student
+            self.uniform_detection_complete = False
+            
+            # CRITICAL: Cancel any pending main screen clear timer for previous student
+            # This ensures the new student's info is shown immediately
+            if hasattr(self, 'main_screen_clear_timer') and self.main_screen_clear_timer is not None:
+                try:
+                    self.root.after_cancel(self.main_screen_clear_timer)
+                    print(f"🔍 Cancelled previous student's main screen clear timer")
+                except Exception:
+                    pass
+                self.main_screen_clear_timer = None
+            
+            # CRITICAL: Immediately update main screen to show DETECTING status for new student
+            # This prevents showing previous student's "complete uniform" status
+            try:
+                from datetime import datetime
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # Get RFID from student_info or current_rfid_for_timer
+                current_rfid = student_info.get('rfid') or getattr(self, 'current_rfid_for_timer', None)
+                student_number = student_info.get('student_id') or student_info.get('student_number')
+                if not student_number or (current_rfid and str(student_number).strip() == str(current_rfid).strip()):
+                    student_number = 'Student Number Not Found'
+                
+                person_info = {
+                    'id': student_number,
+                    'student_id': student_number,
+                    'student_number': student_number,
+                    'rfid': current_rfid,
+                    'name': student_info.get('name', 'Unknown Student'),
+                    'type': 'student',
+                    'course': student_info.get('course', 'Unknown'),
+                    'gender': student_info.get('gender', 'Unknown'),
+                    'timestamp': current_time,
+                    'status': 'DETECTING',  # Show DETECTING status for new student
+                }
+                self.update_main_screen_with_person(person_info)
+                print(f"✅ Main screen updated with DETECTING status for new student: {student_info.get('name', 'Unknown')}")
+            except Exception as e:
+                print(f"⚠️ Error updating main screen for new student: {e}")
             
             # Disable retry button when starting new detection (removed approve_complete_uniform_btn)
             self.incomplete_student_info_for_retry = None
@@ -11977,6 +12447,12 @@ class GuardMainControl:
             
             # Show uniform requirements section when student ID is tapped
             self.show_requirements_section(student_info)
+            
+            # CRITICAL: Reset requirements status label to "IN/COMPLETE UNIFORM" for new student
+            # This ensures it doesn't show "Complete uniform" from previous student
+            if hasattr(self, 'requirements_status_label'):
+                self.requirements_status_label.config(text="IN/COMPLETE UNIFORM", fg='#dc2626')
+                print(f"✅ Reset requirements status label to 'IN/COMPLETE UNIFORM' for new student")
             
             # Reset denied button state flags when new student ID is tapped (but keep button enabled)
             # Only reset flags, don't disable button - it will be enabled when detection starts
@@ -12133,13 +12609,24 @@ class GuardMainControl:
                     
                     print(f"🎥 External detection streaming to UI using model: {model_path}")
                     # Stream frames into the UI live feed
-                    camera_mod.run_detection_stream(
-                        model_path,
-                        frame_callback=self.update_camera_feed,
-                        detected_callback=self.update_detected_classes_list,
-                        stop_event=self.external_detection_stop_event,
-                        conf=0.35,
-                    )
+                    try:
+                        camera_mod.run_detection_stream(
+                            model_path,
+                            frame_callback=None,
+                            detected_callback=self.update_detected_classes_list,
+                            stop_event=self.external_detection_stop_event,
+                            conf=0.35,
+                        )
+                    except Exception as stream_error:
+                        print(f"❌ Error in detection stream: {stream_error}")
+                        import traceback
+                        print(f"❌ Traceback: {traceback.format_exc()}")
+                        # Re-raise to be caught by outer try-except
+                        raise
+                except Exception as e:
+                    print(f"❌ Error in _run_stream: {e}")
+                    import traceback
+                    print(f"❌ Traceback: {traceback.format_exc()}")
                 finally:
                     # Cleanup timer variables
                     # NOTE: DO NOT clear current_student_info_for_timer or current_rfid_for_timer here
@@ -12161,7 +12648,10 @@ class GuardMainControl:
                     except Exception:
                         pass
 
-            threading.Thread(target=_run_stream, daemon=True).start()
+            # Start detection stream in a tracked thread
+            self.external_detection_stream_thread = threading.Thread(target=_run_stream, daemon=True)
+            self.external_detection_stream_thread.start()
+            print("✅ Detection stream thread started")
             return True
         except Exception as e:
             print(f"❌ Failed to start external camera detection: {e}")
@@ -12220,8 +12710,30 @@ class GuardMainControl:
             event_mode = self.event_mode_active
             if event_mode:
                 self.add_activity_log(f"Student Time-Out (Event Mode - No Detection): {student_info['name']} (RFID: {rfid}) - {current_time}")
+                self.add_camera_activity_log(f"EXIT: {student_info['name']} (Event Mode)")
             else:
                 self.add_activity_log(f"Student Time-Out (Permanent): {student_info['name']} (RFID: {rfid}) - {current_time}")
+                self.add_camera_activity_log(f"EXIT: {student_info['name']}")
+            
+            # Add EXIT to main screen activity log (recent entries)
+            try:
+                student_number = student_info.get('student_id') or student_info.get('student_number') or rfid
+                person_data = {
+                    'id': student_number,
+                    'student_id': student_number,
+                    'name': student_info.get('name', f'Student {rfid}'),
+                    'type': 'student',
+                    'course': student_info.get('course', 'Unknown'),
+                    'gender': student_info.get('gender', 'Unknown'),
+                    'timestamp': current_time,
+                    'status': 'EXIT',
+                    'action': 'EXIT',
+                    'guard_id': self.current_guard_id or 'Unknown'
+                }
+                self.add_to_recent_entries(person_data)
+                print(f"📝 Added EXIT to main screen activity log: {student_info.get('name')}")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not add EXIT to main screen activity log: {e}")
             
             # Finalize all pending violations when student exits
             self.finalize_session_violations(rfid)
@@ -12239,22 +12751,7 @@ class GuardMainControl:
             if self.main_screen_window and self.main_screen_window.winfo_exists():
                 self.update_main_screen_with_permanent_student(student_info, 'time_out', current_time, rfid=rfid)
             
-            # Ensure recent entries shows this as EXIT for permanent student
-            try:
-                person_data_exit = {
-                    'id': student_info.get('student_id', rfid),
-                    'name': student_info.get('name', f'Student {rfid}'),
-                    'type': 'student',
-                    'course': student_info.get('course', 'Unknown'),
-                    'gender': student_info.get('gender', 'Unknown'),
-                    'timestamp': current_time,
-                    'status': 'TIME-OUT',
-                    'action': 'EXIT',
-                    'guard_id': self.current_guard_id or 'Unknown'
-                }
-                self.add_to_recent_entries(person_data_exit)
-            except Exception:
-                pass
+            # Entry logging already done above (line 12505-12523)
             # Show success message
             self.show_green_success_message("Student Time-Out", 
                               f"Student: {student_info['name']}\n"
@@ -12427,7 +12924,13 @@ class GuardMainControl:
                 course_val = str(course_val).strip()
             
             # Only show 'Student Number Not Found' if we truly couldn't retrieve it
-            final_student_id = student_num if student_num else 'Student Number Not Found'
+            # CRITICAL: Never use RFID as the ID - always use Student Number or 'Student Number Not Found'
+            if student_num and str(student_num).strip() != '' and str(student_num).strip() != str(rfid).strip():
+                final_student_id = str(student_num).strip()
+            else:
+                # If Student Number is not available, show 'Student Number Not Found' (NOT RFID)
+                final_student_id = 'Student Number Not Found'
+                print(f"⚠️ WARNING: Using 'Student Number Not Found' instead of RFID for ID display")
             
             # Check if this is Event Mode entry (check if event_mode flag is set in student_info)
             is_event_mode = student_info.get('event_mode', False) or getattr(self, 'event_mode_active', False)
@@ -12444,10 +12947,20 @@ class GuardMainControl:
                 else:
                     status = 'TIME-OUT'
             
+            # CRITICAL: Ensure we use Student Number, never RFID
+            # If final_student_id is still RFID or invalid, try to get it from student_info
+            display_id = final_student_id
+            if not display_id or display_id == 'Student Number Not Found' or str(display_id).strip() == str(rfid).strip():
+                # Try to get from student_info directly
+                display_id = student_info.get('student_id') or student_info.get('student_number')
+                if not display_id or str(display_id).strip() == str(rfid).strip():
+                    display_id = 'Student Number Not Found'
+                    print(f"⚠️ WARNING: Using 'Student Number Not Found' - could not retrieve Student Number from Firebase")
+            
             person_info = {
-                'id': final_student_id,  # Use Student Number as ID
-                'student_id': final_student_id,  # Student Number from Firebase
-                'student_number': final_student_id,  # Alternative field name
+                'id': display_id,  # Use Student Number as ID (never RFID)
+                'student_id': display_id,  # Student Number from Firebase
+                'student_number': display_id,  # Alternative field name
                 'rfid': rfid,  # Keep RFID for reference (not displayed as ID)
                 'name': student_info.get('name', 'Unknown Student'),
                 'type': 'student',
@@ -12460,7 +12973,7 @@ class GuardMainControl:
                 # NOTE: Gmail is NOT included for privacy
             }
             
-            print(f"🔍 person_info created with id: {person_info.get('id')}, student_id: {person_info.get('student_id')}")
+            print(f"🔍 person_info created with id: {person_info.get('id')}, student_id: {person_info.get('student_id')}, rfid: {rfid}")
             
             # Update main screen
             self.update_main_screen_with_person(person_info)
@@ -13977,7 +14490,7 @@ class GuardMainControl:
         pass
     
     def create_camera_feed_section(self, parent):
-        """Create camera feed section - simplified, no right panel"""
+        """Create camera feed section with activity log below"""
         camera_frame = tk.LabelFrame(
             parent,
             text="LIVE CAMERA FEED",
@@ -14001,6 +14514,41 @@ class GuardMainControl:
             bd=3
         )
         self.camera_label.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        
+        # Activity Log section below camera feed
+        activity_log_frame = tk.LabelFrame(
+            camera_frame,
+            text="ACTIVITY LOG",
+            font=('Arial', 11, 'bold'),
+            fg='#374151',
+            bg='#ffffff',
+            relief='groove',
+            bd=2
+        )
+        activity_log_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(10, 10))
+        
+        # Activity log text widget with scrollbar
+        log_text_frame = tk.Frame(activity_log_frame, bg='#ffffff')
+        log_text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Text widget for activity log
+        self.camera_activity_log_text = tk.Text(
+            log_text_frame,
+            height=8,
+            font=('Consolas', 9),
+            bg='#f8fafc',
+            fg='#374151',
+            relief='flat',
+            bd=1,
+            wrap=tk.WORD,
+            state=tk.DISABLED
+        )
+        self.camera_activity_log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Scrollbar for activity log
+        log_scrollbar = tk.Scrollbar(log_text_frame, orient=tk.VERTICAL, command=self.camera_activity_log_text.yview)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.camera_activity_log_text.config(yscrollcommand=log_scrollbar.set)
         
         # Set minimum height for portrait orientation
         camera_frame.configure(height=520)
@@ -14040,16 +14588,39 @@ class GuardMainControl:
                     effective = names_list if names_list else getattr(self, '_last_detected_classes', [])
                     
                     # Add detected classes to activity log if there are new detections
-                    if effective and effective != getattr(self, '_last_logged_classes', []):
-                        detected_str = ", ".join(effective)
-                        self.add_activity_log(f"Detected: {detected_str}")
-                        self._last_logged_classes = effective.copy()
+                    # CRITICAL: Don't log continuous detections after complete uniform is detected
+                    # (only log the initial complete uniform detection message)
+                    if not getattr(self, 'uniform_detection_complete', False):
+                        if effective and effective != getattr(self, '_last_logged_classes', []):
+                            detected_str = ", ".join(effective)
+                            self.add_activity_log(f"Detected: {detected_str}")
+                            # Also add to camera activity log
+                            self.add_camera_activity_log(f"Uniform Detected: {detected_str}")
+                            self._last_logged_classes = effective.copy()
 
                     # Update requirements panel against current effective detections
-                    try:
-                        self._update_requirements_status([n.lower() for n in effective])
-                    except Exception:
-                        pass
+                    # Skip updating if detection has ended and checkboxes are editable (preserve manual state)
+                    detection_ended = hasattr(self, 'detection_active') and not self.detection_active
+                    checkboxes_editable = False
+                    if detection_ended and hasattr(self, 'requirement_checkbox_widgets') and self.requirement_checkbox_widgets:
+                        # Check if any checkbox is editable (NORMAL state)
+                        for checkbox_widget in self.requirement_checkbox_widgets.values():
+                            if checkbox_widget:
+                                try:
+                                    if checkbox_widget.cget('state') == tk.NORMAL:
+                                        checkboxes_editable = True
+                                        break
+                                except:
+                                    pass
+                    
+                    # Only update requirements if detection is active or checkboxes are not editable
+                    # _update_requirements_status will return early if uniform_detection_complete is True
+                    # or if detection ended and checkboxes are editable
+                    if not (detection_ended and checkboxes_editable):
+                        try:
+                            self._update_requirements_status([n.lower() for n in effective])
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -14146,6 +14717,11 @@ class GuardMainControl:
     def show_requirements_section(self, student_info=None):
         """Show the uniform requirements section when student ID is tapped."""
         try:
+            # Don't show requirements if uniform detection is complete (entry already recorded)
+            if hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete:
+                print("⚠️ Skipping show_requirements_section - uniform detection complete, entry already recorded")
+                return
+            
             if hasattr(self, 'requirements_frame') and self.requirements_frame:
                 # Update student info if provided
                 if student_info:
@@ -14219,11 +14795,18 @@ class GuardMainControl:
             self.requirement_checkbox_widgets = {}
             
             # Create checkboxes for each requirement
+            # CRITICAL: Check if requirement is permanently checked and preserve that state
+            if not hasattr(self, '_permanently_checked_requirements'):
+                self._permanently_checked_requirements = set()
+            
             for part in self.current_uniform_requirements:
                 key = part.lower()
                 
-                # Create BooleanVar for checkbox state (False = unchecked = missing = shows X)
-                var = tk.BooleanVar(value=False)  # Initially unchecked (missing)
+                # Check if this requirement was permanently checked (detected during detection)
+                is_permanently_checked = key in self._permanently_checked_requirements
+                
+                # Create BooleanVar for checkbox state - preserve permanently checked state
+                var = tk.BooleanVar(value=is_permanently_checked)  # Checked if permanently checked
                 self.requirement_checkboxes[key] = {'var': var, 'part': part}
                 
                 # Create checkbox with label showing "✗ {part}" when unchecked, "{part}" when checked
@@ -14240,9 +14823,12 @@ class GuardMainControl:
                                 checkbox_widget.config(text=f"✗ {part_name}")
                     return update_label
                 
+                # Set initial text based on whether it's permanently checked
+                initial_text = part if is_permanently_checked else f"✗ {part}"
+                
                 checkbox = tk.Checkbutton(
                     self.requirements_container,
-                    text=f"✗ {part}",  # Initially unchecked (missing)
+                    text=initial_text,  # Show part name if checked, ✗ part if unchecked
                     variable=var,
                     font=('Arial', 10),
                     bg='#ffffff',
@@ -14284,10 +14870,41 @@ class GuardMainControl:
         Handles special cases like BSHM female (rtw pants OR rtw skirt).
         """
         try:
-            # If uniform detection is complete, preserve permanently checked requirements
+            # CRITICAL: If detection has ended (detection_active = False), preserve permanently checked requirements
+            # This ensures checkboxes stay checked even after detection stops
+            detection_ended = hasattr(self, 'detection_active') and not self.detection_active
+            
+            # Check if checkboxes are editable (guard can manually check them)
+            checkboxes_editable = False
+            if hasattr(self, 'requirement_checkbox_widgets') and self.requirement_checkbox_widgets:
+                # Check if any checkbox is editable (NORMAL state)
+                for checkbox_widget in self.requirement_checkbox_widgets.values():
+                    if checkbox_widget:
+                        try:
+                            state = checkbox_widget.cget('state')
+                            if state == tk.NORMAL:
+                                checkboxes_editable = True
+                                break
+                        except:
+                            pass
+            
+            # If uniform detection is complete OR detection has ended, preserve permanently checked requirements
             # and don't update based on current detections (to prevent reverting checkboxes)
-            if getattr(self, 'uniform_detection_complete', False):
-                # Uniform is complete - preserve permanently checked requirements
+            if getattr(self, 'uniform_detection_complete', False) or detection_ended:
+                # If checkboxes are editable (guard can manually check them), don't update them at all
+                # Preserve whatever state the guard has set manually
+                if checkboxes_editable and detection_ended:
+                    # Don't update checkboxes - preserve manual state set by guard
+                    # Only update status label
+                    if hasattr(self, 'requirements_status_label'):
+                        if getattr(self, 'uniform_detection_complete', False):
+                            self.requirements_status_label.config(text="Complete uniform", fg='#059669')
+                        else:
+                            # Detection ended but uniform incomplete - keep "Incomplete uniform" status
+                            self.requirements_status_label.config(text="Incomplete uniform", fg='#dc2626')
+                    return  # Exit early - don't update checkboxes, preserve manual state
+                
+                # Uniform is complete or detection ended but checkboxes not editable - preserve permanently checked requirements
                 if not hasattr(self, '_permanently_checked_requirements'):
                     self._permanently_checked_requirements = set()
                 
@@ -14310,11 +14927,15 @@ class GuardMainControl:
                                 if checkbox_widget:
                                     checkbox_widget.config(text=f"✗ {part}")
                 
-                # Keep status as "Complete uniform"
+                # Keep status based on whether uniform is complete or just detection ended
                 if hasattr(self, 'requirements_status_label'):
-                    self.requirements_status_label.config(text="Complete uniform", fg='#059669')
+                    if getattr(self, 'uniform_detection_complete', False):
+                        self.requirements_status_label.config(text="Complete uniform", fg='#059669')
+                    else:
+                        # Detection ended but uniform incomplete - keep "Incomplete uniform" status
+                        self.requirements_status_label.config(text="Incomplete uniform", fg='#dc2626')
                 
-                return  # Exit early - don't process current detections
+                return  # Exit early - don't process current detections (preserve checked state)
             
             required = [p.lower() for p in self.current_uniform_requirements]
             present = set()
@@ -14408,6 +15029,7 @@ class GuardMainControl:
                     present.add(req)
 
             # Update checkboxes - check detected items (no X), uncheck missing items (X)
+            # CRITICAL: Preserve permanently checked requirements even if not currently detected
             if hasattr(self, 'requirement_checkboxes') and self.requirement_checkboxes:
                 for part in self.current_uniform_requirements:
                     key = part.lower()
@@ -14415,14 +15037,18 @@ class GuardMainControl:
                         var = self.requirement_checkboxes[key]['var']
                         checkbox_widget = self.requirement_checkbox_widgets.get(key)
                         
-                        # Update checkbox state based on detection
-                        if key in present:
-                            # Detected - check the checkbox (no X mark)
+                        # Check if requirement is permanently checked OR currently detected
+                        is_permanently_checked = key in self._permanently_checked_requirements
+                        is_currently_detected = key in present
+                        
+                        # Update checkbox state - checked if permanently checked OR currently detected
+                        if is_permanently_checked or is_currently_detected:
+                            # Detected or permanently checked - check the checkbox (no X mark)
                             var.set(True)
                             if checkbox_widget:
                                 checkbox_widget.config(text=part)
                         else:
-                            # Not detected - uncheck the checkbox (X mark)
+                            # Not detected and not permanently checked - uncheck the checkbox (X mark)
                             var.set(False)
                             if checkbox_widget:
                                 checkbox_widget.config(text=f"✗ {part}")
@@ -14566,9 +15192,10 @@ class GuardMainControl:
             
             # Guard UI updates
             # requirements_status_label already shows "Incomplete uniform" (no change needed)
-            # Keep requirements section visible - only hide when gate control button is clicked
-            # Don't schedule hiding - requirements stay visible until guard clicks a button
-            print(f"✅ Requirements section remains visible until gate control button is clicked")
+            # CRITICAL: Do NOT hide requirements section after incomplete uniform
+            # Requirements section should stay visible until guard clicks a gate control button
+            # (ACCESS GRANTED, CANCEL, or DENIED)
+            print(f"✅ Requirements section will remain visible until guard clicks a gate control button")
             
             # Schedule violation finalization if no retry happens within 30 seconds
             # This ensures violations are finalized even if student doesn't tap again
@@ -14583,9 +15210,13 @@ class GuardMainControl:
                 # Finalize after 30 seconds if no retry (student gave up)
                 self.root.after(30000, finalize_if_no_retry)
             
-            # Reset detection tracking variables
+            # CRITICAL: Do NOT reset detection tracking variables after incomplete uniform
+            # Preserve permanently checked requirements so checkboxes stay checked
+            # Only reset detection counts, but keep permanently checked requirements
             self._requirement_detection_counts = {}
-            self._permanently_checked_requirements = set()
+            # DO NOT clear _permanently_checked_requirements - preserve checked state
+            # self._permanently_checked_requirements = set()  # REMOVED - preserve checked requirements
+            print(f"✅ Preserved permanently checked requirements - checkboxes will remain checked")
             
             # CRITICAL: Enable all buttons when incomplete uniform is detected (first entry)
             # This is the first entry attempt, so student hasn't entered yet
@@ -14637,18 +15268,43 @@ class GuardMainControl:
             # Main screen updates - show incomplete uniform indicator
             self.update_main_screen_with_incomplete_uniform(student_info)
             
-            # Stop detection stream
-            if hasattr(self, 'external_detection_stop_event') and self.external_detection_stop_event:
-                self.external_detection_stop_event.set()
-                print(f"🛑 Stopping detection stream due to timeout")
+            # CRITICAL: Do NOT stop detection stream (camera) - keep it running
+            # Camera should continue showing live feed even after incomplete uniform timeout
+            # Only stop detection processing, not the camera feed
+            print(f"✅ Detection processing stopped - camera feed continues running (incomplete uniform)")
             
             # Re-enable ID input field - detection completed (incomplete uniform timeout)
             if hasattr(self, 'person_id_entry'):
                 self.person_id_entry.config(state=tk.NORMAL)
                 print(f"🔓 ID input field enabled - detection completed (timeout)")
             
-            # Mark detection as inactive
+            # Mark detection as inactive (stops processing, but camera continues)
             self.detection_active = False
+            
+            # CRITICAL: Ensure buttons are enabled BEFORE any other operations
+            # This prevents them from being disabled by other code
+            if hasattr(self, 'approve_button'):
+                try:
+                    self.approve_button.config(state=tk.NORMAL)
+                    print(f"✅ APPROVE button enabled - detection ended (incomplete uniform)")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable APPROVE button: {e}")
+            
+            if hasattr(self, 'cancel_button'):
+                try:
+                    self.cancel_button.config(state=tk.NORMAL)
+                    print(f"✅ CANCEL button enabled - detection ended (incomplete uniform)")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable CANCEL button: {e}")
+            
+            if hasattr(self, 'deny_button'):
+                try:
+                    self.deny_button.config(state=tk.NORMAL)
+                    print(f"✅ DENIED button enabled - detection ended (incomplete uniform)")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+            
+            # Buttons are already enabled above - no need to enable again
             
             # Log activity
             current_time = self.get_current_timestamp()
@@ -14725,8 +15381,47 @@ class GuardMainControl:
             
             # Restore guard camera feed (will happen in finally block of _run_stream)
             
+            # CRITICAL: Final check - ensure all buttons are enabled at the end
+            # This guarantees buttons are enabled even if something else tried to disable them
+            if hasattr(self, 'approve_button'):
+                try:
+                    if str(self.approve_button.cget('state')) != 'normal':
+                        self.approve_button.config(state=tk.NORMAL)
+                        print(f"✅ APPROVE button force-enabled at end of incomplete uniform handler")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not verify/enable APPROVE button: {e}")
+            
+            if hasattr(self, 'cancel_button'):
+                try:
+                    if str(self.cancel_button.cget('state')) != 'normal':
+                        self.cancel_button.config(state=tk.NORMAL)
+                        print(f"✅ CANCEL button force-enabled at end of incomplete uniform handler")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not verify/enable CANCEL button: {e}")
+            
+            if hasattr(self, 'deny_button'):
+                try:
+                    if str(self.deny_button.cget('state')) != 'normal':
+                        self.deny_button.config(state=tk.NORMAL)
+                        print(f"✅ DENIED button force-enabled at end of incomplete uniform handler")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not verify/enable DENIED button: {e}")
+            
         except Exception as e:
             print(f"❌ Error handling incomplete uniform timeout: {e}")
+            
+            # CRITICAL: Even if there's an error, ensure buttons are enabled
+            # Guard needs to be able to make a decision even if something went wrong
+            try:
+                if hasattr(self, 'approve_button'):
+                    self.approve_button.config(state=tk.NORMAL)
+                if hasattr(self, 'cancel_button'):
+                    self.cancel_button.config(state=tk.NORMAL)
+                if hasattr(self, 'deny_button'):
+                    self.deny_button.config(state=tk.NORMAL)
+                print(f"✅ Buttons enabled even after error in incomplete uniform handler")
+            except Exception:
+                pass
 
     def _schedule_complete_uniform_auto_entry(self, rfid, student_info):
         """Schedule automatic entry after 8 seconds if guard doesn't click DENIED"""
@@ -14803,8 +15498,36 @@ class GuardMainControl:
                               "👤 Student may proceed\n"
                               "✅ Auto-entry after 8 seconds")
             
-            # Reset all button states (ACCESS GRANTED and CANCEL disabled, DENIED enabled)
-            self._reset_denied_button_state()
+            # CRITICAL: After auto-entry for complete uniform, only DENIED button should be enabled
+            # ACCESS GRANTED and CANCEL buttons should remain disabled
+            # Do NOT call _reset_denied_button_state() - it disables all buttons
+            # Instead, just reset the flags but keep buttons in correct state
+            self.denied_button_clicked = False
+            self.original_detection_state = None
+            self.original_uniform_status = None
+            
+            # Keep ACCESS GRANTED and CANCEL disabled, only DENIED enabled
+            if hasattr(self, 'approve_button') and self.approve_button:
+                try:
+                    self.approve_button.config(state=tk.DISABLED)
+                    print(f"❌ ACCESS GRANTED button disabled after auto-entry (complete uniform)")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not disable ACCESS GRANTED button: {e}")
+            
+            if hasattr(self, 'cancel_button') and self.cancel_button:
+                try:
+                    self.cancel_button.config(state=tk.DISABLED)
+                    print(f"❌ CANCEL button disabled after auto-entry (complete uniform)")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not disable CANCEL button: {e}")
+            
+            if hasattr(self, 'deny_button') and self.deny_button:
+                try:
+                    self.deny_button.config(state=tk.NORMAL)
+                    print(f"✅ DENIED button remains enabled after auto-entry")
+                except Exception as e:
+                    print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+            
             self.complete_uniform_student_info = None
             
             # Hide requirements section
@@ -14856,21 +15579,21 @@ class GuardMainControl:
             # Store student info for potential auto-entry
             self.complete_uniform_student_info = student_info.copy() if student_info else None
             
-            # CRITICAL: Enable all buttons for complete uniform - guard can review and decide
-            # Enable ACCESS GRANTED, CANCEL, and DENIED buttons
+            # CRITICAL: When complete uniform is detected, only DENIED button should be enabled
+            # ACCESS GRANTED and CANCEL buttons should remain disabled
             if hasattr(self, 'approve_button'):
                 try:
-                    self.approve_button.config(state=tk.NORMAL)
-                    print(f"✅ APPROVE button enabled - complete uniform detected, guard can review")
+                    self.approve_button.config(state=tk.DISABLED)
+                    print(f"❌ ACCESS GRANTED button disabled - complete uniform detected, only DENIED enabled")
                 except Exception as e:
-                    print(f"⚠️ WARNING: Could not enable APPROVE button: {e}")
+                    print(f"⚠️ WARNING: Could not disable ACCESS GRANTED button: {e}")
             
             if hasattr(self, 'cancel_button'):
                 try:
-                    self.cancel_button.config(state=tk.NORMAL)
-                    print(f"✅ CANCEL button enabled - complete uniform detected, guard can review")
+                    self.cancel_button.config(state=tk.DISABLED)
+                    print(f"❌ CANCEL button disabled - complete uniform detected, only DENIED enabled")
                 except Exception as e:
-                    print(f"⚠️ WARNING: Could not enable CANCEL button: {e}")
+                    print(f"⚠️ WARNING: Could not disable CANCEL button: {e}")
             
             # Reset denied button state flags first (but don't disable - will enable after reset)
             self.denied_button_clicked = False
@@ -14899,6 +15622,8 @@ class GuardMainControl:
             self._schedule_complete_uniform_auto_entry(rfid, student_info)
             
             # Update main screen to show COMPLETE UNIFORM status (waiting for guard decision)
+            # NOTE: Do NOT log to activity log here - entry will be logged in record_complete_uniform_entry
+            # after guard approves or auto-entry triggers
             from datetime import datetime
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             person_info = {
@@ -14909,7 +15634,8 @@ class GuardMainControl:
                 'gender': student_info.get('gender', 'Unknown'),
                 'timestamp': current_time,
                 'status': 'COMPLETE UNIFORM',  # Will show as complete uniform, waiting for guard
-                'action': 'DETECTING',  # Not yet entry - waiting for guard decision
+                # Do NOT set 'action' here - let update_main_screen_with_person determine it from status
+                # This prevents incorrect 'DETECTING' from being logged
                 'guard_id': self.current_guard_id or 'Unknown'
             }
             # Mark uniform detection as complete
@@ -14917,17 +15643,66 @@ class GuardMainControl:
             if self.main_screen_window and self.main_screen_window.winfo_exists():
                 self.update_main_screen_with_person(person_info)
             
+            # Add activity log entry when complete uniform is detected
+            self.add_activity_log(f"✅ Complete Uniform Detected: {student_info.get('name', 'Unknown')} (RFID: {rfid}) - {current_time}")
+            self.add_camera_activity_log(f"✅ Complete Uniform Detected: {student_info.get('name', 'Unknown')}")
+            
             # Show complete uniform popup with countdown info
             self.show_complete_uniform_popup_with_countdown(student_info)
             
-            # Stop detection stream
-            if hasattr(self, 'external_detection_stop_event') and self.external_detection_stop_event:
-                self.external_detection_stop_event.set()
-                print(f"🛑 Stopping detection stream - uniform complete")
+            # CRITICAL: Do NOT stop detection stream here - camera should continue working
+            # Detection will continue in the background until entry is recorded
+            # The camera will only stop after record_complete_uniform_entry() is called
+            print(f"✅ Complete uniform detected - camera continues running until entry is recorded")
             
-            # Keep requirements section visible - only hide when gate control button is clicked
-            # Don't schedule hiding - requirements stay visible until guard clicks a button
-            print(f"✅ Requirements section remains visible until gate control button is clicked")
+            # Schedule hiding requirements section after 5 seconds
+            # Requirements will only show again when a new RFID is tapped
+            def hide_requirements_after_delay():
+                try:
+                    if hasattr(self, 'requirements_frame') and self.requirements_frame:
+                        self.requirements_frame.pack_forget()
+                        print("✅ Requirements section hidden after 5 seconds (complete uniform)")
+                    # Show spacer again when requirements are hidden
+                    if hasattr(self, 'requirements_spacer') and self.requirements_spacer:
+                        try:
+                            self.requirements_spacer.pack(fill=tk.X)
+                        except:
+                            pass
+                    
+                    # CRITICAL: Ensure buttons remain in correct state after hiding requirements
+                    # For complete uniform: only DENIED enabled, ACCESS GRANTED and CANCEL disabled
+                    if hasattr(self, 'approve_button') and self.approve_button:
+                        try:
+                            # Keep ACCESS GRANTED disabled for complete uniform
+                            if str(self.approve_button.cget('state')) != 'disabled':
+                                self.approve_button.config(state=tk.DISABLED)
+                                print(f"❌ ACCESS GRANTED button kept disabled after hiding requirements (complete uniform)")
+                        except Exception as e:
+                            print(f"⚠️ WARNING: Could not verify/disable ACCESS GRANTED button: {e}")
+                    
+                    if hasattr(self, 'cancel_button') and self.cancel_button:
+                        try:
+                            # Keep CANCEL disabled for complete uniform
+                            if str(self.cancel_button.cget('state')) != 'disabled':
+                                self.cancel_button.config(state=tk.DISABLED)
+                                print(f"❌ CANCEL button kept disabled after hiding requirements (complete uniform)")
+                        except Exception as e:
+                            print(f"⚠️ WARNING: Could not verify/disable CANCEL button: {e}")
+                    
+                    if hasattr(self, 'deny_button') and self.deny_button:
+                        try:
+                            # Keep DENIED enabled for complete uniform
+                            if str(self.deny_button.cget('state')) != 'normal':
+                                self.deny_button.config(state=tk.NORMAL)
+                                print(f"✅ DENIED button re-enabled after hiding requirements")
+                        except Exception as e:
+                            print(f"⚠️ WARNING: Could not verify/enable DENIED button: {e}")
+                except Exception as e:
+                    print(f"⚠️ Error hiding requirements section: {e}")
+            
+            # Schedule hiding after 5 seconds (5000 milliseconds)
+            self.root.after(5000, hide_requirements_after_delay)
+            print(f"✅ Scheduled requirements section to hide after 5 seconds (complete uniform)")
             
             # Reset detection tracking counts but PRESERVE permanently checked requirements
             # This ensures checkboxes stay checked even after detection completes
@@ -14944,8 +15719,9 @@ class GuardMainControl:
                 self.person_id_entry.config(state=tk.NORMAL)
                 print(f"🔓 ID input field enabled - detection completed (complete uniform)")
             
-            # Mark detection as inactive
-            self.detection_active = False
+            # CRITICAL: Do NOT mark detection as inactive here - keep it active until entry is recorded
+            # Detection will continue running in the background
+            # self.detection_active = False  # REMOVED - keep detection active until entry recorded
             
         except Exception as e:
             print(f"❌ Error handling complete uniform detection: {e}")
@@ -15018,14 +15794,10 @@ class GuardMainControl:
             # Hide requirements section
             self.hide_requirements_section()
             
-            # Stop detection if still running
-            if hasattr(self, 'detection_system') and self.detection_system:
-                self.detection_system.stop_detection()
-            
-            if hasattr(self, 'external_detection_stop_event') and self.external_detection_stop_event:
-                self.external_detection_stop_event.set()
-            
-            self.detection_active = False
+            # CRITICAL: Do NOT stop detection system or camera here
+            # record_complete_uniform_entry() already handles stopping detection processing
+            # while keeping the camera feed running
+            # Detection processing is stopped but camera continues
             
             # Re-enable ID input field
             if hasattr(self, 'person_id_entry'):
@@ -15364,8 +16136,8 @@ class GuardMainControl:
                 except Exception:
                     pass
             
-            self.main_screen_clear_timer = self.root.after(15000, self._clear_main_screen_after_delay)
-            print(f"✅ Scheduled main screen clear after 15 seconds (entry was saved) - timer ID: {self.main_screen_clear_timer}")
+            self.main_screen_clear_timer = self.root.after(10000, self._clear_main_screen_after_delay)
+            print(f"✅ Scheduled main screen clear after 10 seconds (entry was saved) - timer ID: {self.main_screen_clear_timer}")
             
             return  # Exit early - don't clear main screen immediately
             
@@ -16271,26 +17043,15 @@ class GuardMainControl:
                 # Make requirement checkboxes editable
                 self._make_requirement_checkboxes_editable(True)
                 
-                # Stop detection immediately when DENIED is clicked during detection
+                # Stop detection processing when DENIED is clicked during detection
+                # But keep camera feed running - camera should stay alive
                 if hasattr(self, 'detection_active') and self.detection_active:
-                    print("🛑 Stopping detection - DENIED button clicked during detection")
+                    print("🛑 Stopping detection processing - DENIED button clicked (camera continues running)")
                     self.detection_active = False
                     
-                    # Stop detection system
-                    if hasattr(self, 'detection_system') and self.detection_system:
-                        try:
-                            self.detection_system.stop_detection()
-                            print("✅ Detection system stopped")
-                        except Exception as e:
-                            print(f"⚠️ Error stopping detection system: {e}")
-                    
-                    # Stop external detection stop event
-                    if hasattr(self, 'external_detection_stop_event') and self.external_detection_stop_event:
-                        try:
-                            self.external_detection_stop_event.set()
-                            print("✅ External detection stop event set")
-                        except Exception as e:
-                            print(f"⚠️ Error setting stop event: {e}")
+                    # CRITICAL: Do NOT stop detection system or camera - keep them running
+                    # Only stop detection processing, not the camera feed
+                    print("✅ Detection processing stopped - camera feed continues running")
                 
                 # CRITICAL: Check if this is approved violation re-entry scenario
                 is_approved_violation_scenario = (
@@ -17559,8 +18320,16 @@ class GuardMainControl:
             if status not in ('DETECTING', 'INCOMPLETE UNIFORM'):
                 # Only log ENTRY/EXIT, not detection states
                 # Skip for teachers to avoid duplicates (they add entries in handle_teacher_timein/timeout)
+                # Skip for students with COMPLETE UNIFORM status - entry will be logged in record_complete_uniform_entry
+                # after guard approves or auto-entry triggers
                 if person_type != 'teacher':
-                    self.add_to_recent_entries(person_info)
+                    status_val = str(person_info.get('status', '')).upper()
+                    action_val = str(person_info.get('action', '')).upper()
+                    # Don't log if it's a student with COMPLETE UNIFORM status (entry will be logged later)
+                    if person_type == 'student' and (status_val == 'COMPLETE UNIFORM' or action_val == 'DETECTING'):
+                        print(f"⏭️ Skipping activity log entry for student with COMPLETE UNIFORM - will be logged in record_complete_uniform_entry")
+                    else:
+                        self.add_to_recent_entries(person_info)
             
             # Schedule clearing main screen after 15 seconds (15000 milliseconds)
             self._schedule_main_screen_clear()
@@ -17601,9 +18370,9 @@ class GuardMainControl:
                     pass
                 self.main_screen_clear_timer = None
             
-            # Schedule new clear timer (15 seconds = 15000 milliseconds)
-            self.main_screen_clear_timer = self.root.after(15000, self._clear_main_screen_after_delay)
-            print(f"✅ Scheduled main screen clear after 15 seconds")
+            # Schedule new clear timer (10 seconds = 10000 milliseconds)
+            self.main_screen_clear_timer = self.root.after(10000, self._clear_main_screen_after_delay)
+            print(f"✅ Scheduled main screen clear after 10 seconds")
         except Exception as e:
             print(f"⚠️ Error scheduling main screen clear: {e}")
     
@@ -17623,7 +18392,7 @@ class GuardMainControl:
             # (Detection might still be running and we don't want to interrupt it)
             if hasattr(self, 'detection_active') and self.detection_active:
                 print(f"⏸️ Main screen clear skipped - detection still active")
-                # Reschedule for another 15 seconds
+                # Reschedule for another 10 seconds
                 self._schedule_main_screen_clear()
                 return
             
@@ -17634,23 +18403,36 @@ class GuardMainControl:
                 hasattr(self, 'uniform_detection_complete') and self.uniform_detection_complete
             )
             
-            if not entry_was_saved:
-                # Only check for pending violations if entry was NOT saved
-                # Violation is pending if incomplete_student_info_for_approve is set or if there are active violations
-                has_pending_violation = (
-                    hasattr(self, 'incomplete_student_info_for_approve') and 
-                    self.incomplete_student_info_for_approve is not None
-                ) or (
-                    hasattr(self, 'active_session_violations') and 
-                    self.active_session_violations and 
-                    any(len(violations) > 0 for violations in self.active_session_violations.values())
-                )
-                
-                if has_pending_violation:
-                    print(f"⏸️ Main screen clear skipped - violation pending, waiting for gate control button")
-                    return
+            print(f"🔍 Clear check: detection_active={getattr(self, 'detection_active', 'N/A')}, uniform_detection_complete={getattr(self, 'uniform_detection_complete', 'N/A')}, entry_was_saved={entry_was_saved}")
+            
+            # CRITICAL: Check for pending incomplete uniform BEFORE clearing screen
+            # If incomplete uniform is pending, DO NOT clear screen - guard needs to make a decision
+            has_pending_incomplete_uniform = (
+                hasattr(self, 'incomplete_student_info_for_approve') and 
+                self.incomplete_student_info_for_approve is not None
+            )
+            
+            if has_pending_incomplete_uniform:
+                print(f"⏸️ Main screen clear CANCELLED - incomplete uniform pending, waiting for guard decision")
+                print(f"   Buttons remain enabled for guard to choose ACCESS GRANTED, CANCEL, or DENIED")
+                return
+            
+            # CRITICAL: If detection is not active, entry was saved - ALWAYS clear the screen
+            # Don't check for violations - just clear after 10 seconds as scheduled
+            if not self.detection_active:
+                print(f"✅ Detection not active - entry was saved, proceeding with main screen clear")
             else:
-                print(f"✅ Entry was saved - proceeding with main screen clear (violations already finalized)")
+                # Detection still active - check for violations only if entry was NOT saved
+                if not entry_was_saved:
+                    has_pending_violation = (
+                        hasattr(self, 'active_session_violations') and 
+                        self.active_session_violations and 
+                        any(len(violations) > 0 for violations in self.active_session_violations.values())
+                    )
+                    
+                    if has_pending_violation:
+                        print(f"⏸️ Main screen clear skipped - violation pending, waiting for gate control button")
+                        return
             
             # Clear all widgets from person display frame
             if hasattr(self, 'person_display_frame'):
@@ -17663,27 +18445,60 @@ class GuardMainControl:
             # Return to standby mode - show standby message
             self.show_standby_message()
             
-            # CRITICAL: Disable DENIED button when returning to standby
-            # This ensures buttons are disabled after entry status is displayed and cleared
-            if hasattr(self, 'deny_button') and self.deny_button:
-                try:
-                    self.deny_button.config(state=tk.DISABLED)
-                    print(f"✅ DENIED button disabled - returned to standby")
-                except Exception as e:
-                    print(f"⚠️ WARNING: Could not disable DENIED button: {e}")
+            # CRITICAL: Check if there's a pending incomplete uniform before disabling buttons
+            # If incomplete uniform is pending, buttons MUST stay enabled for guard to make a decision
+            has_pending_incomplete_uniform = (
+                hasattr(self, 'incomplete_student_info_for_approve') and 
+                self.incomplete_student_info_for_approve is not None
+            )
             
-            # Also ensure APPROVE and CANCEL buttons are disabled
-            if hasattr(self, 'approve_button') and self.approve_button:
-                try:
-                    self.approve_button.config(state=tk.DISABLED)
-                except Exception as e:
-                    pass
-            
-            if hasattr(self, 'cancel_button') and self.cancel_button:
-                try:
-                    self.cancel_button.config(state=tk.DISABLED)
-                except Exception as e:
-                    pass
+            if has_pending_incomplete_uniform:
+                # CRITICAL: Keep ALL buttons enabled - guard needs to make a decision
+                print(f"✅ Incomplete uniform pending - keeping all buttons ENABLED for guard decision")
+                if hasattr(self, 'approve_button') and self.approve_button:
+                    try:
+                        self.approve_button.config(state=tk.NORMAL)
+                        print(f"✅ ACCESS GRANTED button remains enabled - incomplete uniform pending")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not enable ACCESS GRANTED button: {e}")
+                
+                if hasattr(self, 'cancel_button') and self.cancel_button:
+                    try:
+                        self.cancel_button.config(state=tk.NORMAL)
+                        print(f"✅ CANCEL button remains enabled - incomplete uniform pending")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not enable CANCEL button: {e}")
+                
+                if hasattr(self, 'deny_button') and self.deny_button:
+                    try:
+                        self.deny_button.config(state=tk.NORMAL)
+                        print(f"✅ DENIED button remains enabled - incomplete uniform pending")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not enable DENIED button: {e}")
+            else:
+                # No pending incomplete uniform - safe to disable buttons when returning to standby
+                # CRITICAL: Disable DENIED button when returning to standby (only if no pending incomplete uniform)
+                if hasattr(self, 'deny_button') and self.deny_button:
+                    try:
+                        self.deny_button.config(state=tk.DISABLED)
+                        print(f"✅ DENIED button disabled - returned to standby (no pending incomplete uniform)")
+                    except Exception as e:
+                        print(f"⚠️ WARNING: Could not disable DENIED button: {e}")
+                
+                # Also ensure APPROVE and CANCEL buttons are disabled
+                if hasattr(self, 'approve_button') and self.approve_button:
+                    try:
+                        self.approve_button.config(state=tk.DISABLED)
+                        print(f"✅ ACCESS GRANTED button disabled - returned to standby")
+                    except Exception as e:
+                        pass
+                
+                if hasattr(self, 'cancel_button') and self.cancel_button:
+                    try:
+                        self.cancel_button.config(state=tk.DISABLED)
+                        print(f"✅ CANCEL button disabled - returned to standby")
+                    except Exception as e:
+                        pass
             
             print(f"✅ Main screen cleared - returned to standby")
             
@@ -18535,6 +19350,25 @@ once camera is fully initialized"""
             
         except Exception as e:
             print(f"ERROR: Error adding to activity log: {e}")
+    
+    def add_camera_activity_log(self, message):
+        """Add message to camera feed activity log"""
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            log_entry = f"[{timestamp}] {message}\n"
+            
+            # Update camera activity log text widget if it exists
+            if hasattr(self, 'camera_activity_log_text') and self.camera_activity_log_text and self.camera_activity_log_text.winfo_exists():
+                try:
+                    self.camera_activity_log_text.config(state=tk.NORMAL)
+                    self.camera_activity_log_text.insert(tk.END, log_entry)
+                    self.camera_activity_log_text.see(tk.END)
+                    self.camera_activity_log_text.config(state=tk.DISABLED)
+                except Exception as e:
+                    print(f"WARNING: Could not update camera activity log text widget: {e}")
+            
+        except Exception as e:
+            print(f"ERROR: Error adding to camera activity log: {e}")
     
     def show_green_success_message(self, title, message):
         """Show a success message with green color"""
